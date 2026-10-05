@@ -64,3 +64,8 @@ python linkedin_crawler.py join                 # output/places_with_linkedin.cs
 
 Statuses in `crawl.db`: `found`, `none` (site works, no LinkedIn link), `robots` (site disallows
 crawling), `skipped` (social/booking platforms, not a company site), `error` (dead or unreachable).
+
+**Directory sites:** some businesses list a directory page as their website (e.g. `gelbeseiten.de`,
+244k German places). `join` won't give those businesses the directory's own LinkedIn page: a domain
+with 20+ places where under 20% of place names contain the domain's brand is treated as a
+directory and listed in `output/directory_domains.csv`. Chains like `walmart.com` keep their link.

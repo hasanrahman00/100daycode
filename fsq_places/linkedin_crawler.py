@@ -310,12 +310,46 @@ def cmd_join(args):
     select = csv_safe_select(con, source)
     con.execute(f"CREATE VIEW p AS SELECT *, {DOMAIN_SQL} AS domain FROM read_parquet('{source}')")
     con.execute(f"""
+        CREATE TEMP TABLE l AS
+        SELECT domain, linkedin_url FROM read_csv('{linkedin}', header=true, quote='"', columns={{
+            'domain': 'VARCHAR', 'linkedin_url': 'VARCHAR', 'country': 'VARCHAR', 'places': 'BIGINT'}})
+    """)
+
+    # Directory sites (gelbeseiten.de, yelp-style listings) appear as the "website" of thousands of
+    # unrelated businesses; their LinkedIn page belongs to the directory, not to those businesses.
+    # Chains (walmart.com) are told apart because most of their place names contain the brand.
+    con.execute(f"""
+        CREATE TEMP TABLE directories AS
+        WITH labeled AS (
+            SELECT domain, name, string_split(domain, '.') AS parts
+            FROM p WHERE domain IN (SELECT domain FROM l)
+        ), branded AS (
+            SELECT domain, name,
+                   regexp_replace(CASE
+                       WHEN len(parts) >= 3 AND parts[len(parts) - 1] IN
+                            ('co', 'com', 'org', 'net', 'gov', 'edu', 'ac', 'or', 'ne', 'go', 'gob')
+                       THEN parts[len(parts) - 2] ELSE parts[len(parts) - 1] END, '[^a-z0-9]', '', 'g') AS brand
+            FROM labeled
+        )
+        SELECT domain, count(*) AS places,
+               avg(CASE WHEN contains(regexp_replace(lower(name), '[^a-z0-9]', '', 'g'), brand)
+                        THEN 1 ELSE 0 END) AS brand_share
+        FROM branded
+        GROUP BY domain
+        HAVING count(*) >= {args.min_places} AND brand_share < {args.min_brand_share}
+    """)
+    dirs = con.execute("SELECT domain, places, brand_share FROM directories ORDER BY places DESC").fetchall()
+    if dirs:
+        print(f"Not attaching LinkedIn to {len(dirs):,} directory-like domains, e.g.:")
+        for d, n, share in dirs[:10]:
+            print(f"  {d:<40} {n:>9,} places, {share:.0%} named after the domain")
+        con.execute(f"COPY directories TO '{args.out_dir / 'directory_domains.csv'}' (FORMAT CSV, HEADER)")
+
+    con.execute(f"""
         COPY (
             SELECT {select}, l.linkedin_url
-            FROM p JOIN (
-                SELECT domain, linkedin_url FROM read_csv('{linkedin}', header=true, quote='"', columns={{
-                    'domain': 'VARCHAR', 'linkedin_url': 'VARCHAR', 'country': 'VARCHAR', 'places': 'BIGINT'}})
-            ) l USING (domain)
+            FROM p JOIN l USING (domain)
+            WHERE domain NOT IN (SELECT domain FROM directories)
         ) TO '{out}' (FORMAT CSV, HEADER)
     """)
     n = con.execute(f"SELECT count(*) FROM read_csv('{out}', header=true)").fetchone()[0]
@@ -347,6 +381,10 @@ def main():
     s = sub.add_parser("join", help="Write places_with_linkedin.csv: every FSQ column + linkedin_url")
     s.add_argument("--data-dir", default="data")
     s.add_argument("--source", help="Parquet glob to use instead of the downloaded release")
+    s.add_argument("--min-places", type=int, default=20,
+                   help="Only check domains with at least this many places for being a directory")
+    s.add_argument("--min-brand-share", type=float, default=0.2,
+                   help="Below this share of place names containing the domain's brand = directory")
     s.set_defaults(func=cmd_join)
 
     args = p.parse_args()
