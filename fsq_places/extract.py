@@ -156,6 +156,21 @@ def _walk_jsonld(node, found):
                 _walk_jsonld(v, found)
 
 
+def _jsonld_address(org: dict) -> str | None:
+    addr = org.get("address")
+    if not addr and isinstance(org.get("location"), dict):
+        addr = org["location"].get("address")
+    if isinstance(addr, list):
+        addr = addr[0] if addr else None
+    if isinstance(addr, dict):
+        country = addr.get("addressCountry")
+        if isinstance(country, dict):
+            country = country.get("name")
+        parts = [addr.get(k) for k in ("streetAddress", "addressLocality", "addressRegion", "postalCode")]
+        addr = ", ".join(str(x).strip() for x in [*parts, country] if isinstance(x, (str, int)) and str(x).strip())
+    return _clean_address(addr) if isinstance(addr, str) else None
+
+
 def jsonld_org(html: str) -> dict:
     """schema.org Organization/LocalBusiness data that many sites embed for Google."""
     orgs = []
@@ -167,13 +182,7 @@ def jsonld_org(html: str) -> dict:
     if not orgs:
         return {}
     o = orgs[0]
-    addr = o.get("address")
-    if isinstance(addr, list):
-        addr = addr[0] if addr else None
-    if isinstance(addr, dict):
-        addr = ", ".join(str(addr[k]) for k in ("streetAddress", "addressLocality", "addressRegion",
-                                                "postalCode", "addressCountry")
-                         if isinstance(addr.get(k), (str, int)) and addr.get(k))
+    addr = next((a for org in orgs if (a := _jsonld_address(org))), None)
     same_as = o.get("sameAs") or []
     same_as = [same_as] if isinstance(same_as, str) else same_as
     employees = o.get("numberOfEmployees")
@@ -185,6 +194,93 @@ def jsonld_org(html: str) -> dict:
         "employees": employees, "jsonld_phone": o.get("telephone"), "jsonld_email": o.get("email"),
         "same_as": " ".join(s for s in same_as if isinstance(s, str)),
     }.items() if isinstance(v, (str, int)) and str(v).strip()}
+
+
+# ---------------------------------------------------------------- postal address
+
+MICRODATA_RE = re.compile(
+    r"""itemprop\s*=\s*["'](streetAddress|addressLocality|addressRegion|postalCode|addressCountry)["']"""
+    r"""(?:[^>]*\bcontent\s*=\s*["']([^"']*)["'])?[^>]*>([^<]{0,150})""", re.I)
+ADDRESS_TAG_RE = re.compile(r"<address[^>]*>(.*?)</address>", re.I | re.S)
+MAPS_RE = re.compile(
+    r"""(?:google\.[a-z.]+/maps(?:/place/|/search/|/dir/[^/"']*/|/?\?(?:[^"'#]*&)?q=)|maps\.google\.[a-z.]+/"""
+    r"""(?:maps)?\?(?:[^"'#]*&)?q=|maps\.apple\.com/\?(?:[^"'#]*&)?(?:address|q)=)([^"'&#<>/]{8,200})""", re.I)
+TAGS_RE = re.compile(r"<[^>]+>")
+SCRIPT_STYLE_RE = re.compile(r"<(script|style|noscript|svg)[^>]*>.*?</\1>", re.I | re.S)
+STREET = (r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|Place|Pl|"
+          r"Parkway|Pkwy|Highway|Hwy|Circle|Cir|Terrace|Trail|Square|Sq|Plaza|Suite|Ste|Unit|Floor|Fl)")
+TEXT_ADDRESS_RES = [
+    # US: 123 Main St, Suite 4, Springfield, IL 62701
+    re.compile(rf"\b\d{{1,6}}\s+(?:[A-Z0-9][\w'.\-]*\s+){{0,5}}{STREET}\b\.?[^\n|]{{0,80}}?,\s*"
+               r"[A-Za-z .'\-]{2,40},?\s+[A-Z]{2}\s+\d{5}(?:-\d{4})?\b"),
+    # Canada: ... Toronto, ON M5V 2T6
+    re.compile(r"\b\d{1,6}\s+[^\n|]{3,80}?,\s*[A-Za-z .'\-]{2,40},?\s+"
+               r"(?:AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT)\s+[A-Z]\d[A-Z]\s?\d[A-Z]\d\b"),
+    # UK: 10 Downing Street, London SW1A 2AA
+    re.compile(r"\b\d{1,4}[A-Za-z]?\s+[A-Z][\w'.\- ]{2,60},\s*(?:[A-Z][\w'.\- ]{2,40},?\s+){0,2}"
+               r"[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}\b"),
+    # Germany/Austria/Switzerland: Hauptstraße 5, 10115 Berlin
+    re.compile(r"\b[A-ZÄÖÜ][\wäöüß.\- ]{2,40}(?:straße|strasse|str\.|weg|platz|allee|gasse|ring|damm)"
+               r"\s*\d{1,4}[a-z]?\s*,?\s+(?:D-|A-|CH-)?\d{4,5}\s+[A-ZÄÖÜ][\wäöüß.\- ]{2,40}", re.I),
+]
+
+
+TEXT_ADDRESS_ANCHORS = [  # one per pattern above, same order
+    re.compile(r"\b[A-Z]{2}\s+\d{5}\b"),                                   # US state + ZIP
+    re.compile(r"\b[A-Z]\d[A-Z]\s?\d[A-Z]\d\b"),                             # Canadian postcode
+    re.compile(r"\b[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}\b"),                     # UK postcode
+    re.compile(r"(?:straße|strasse|str\.|weg|platz|allee|gasse|ring|damm)\s*\d", re.I),  # DE street
+]
+
+
+def _clean_address(text: str | None) -> str | None:
+    if not text:
+        return None
+    a = re.sub(r"\s+", " ", htmllib.unescape(text)).strip(" ,;|-")
+    a = re.sub(r"\s*,\s*", ", ", a)
+    if not (8 <= len(a) <= 200) or not re.search(r"\d", a) or not re.search(r"[A-Za-zÀ-ÿ]{2}", a):
+        return None
+    if re.fullmatch(r"[-\d.,\s]+", a):  # bare coordinates
+        return None
+    return a
+
+
+def visible_text(html: str) -> str:
+    if len(html) > 600_000:  # keep the header and the footer, where addresses usually are
+        html = html[:300_000] + "\n" + html[-300_000:]
+    text = SCRIPT_STYLE_RE.sub(" ", html)
+    text = re.sub(r"<br\s*/?>|</(?:p|div|li|td|tr|h\d)>", "\n", text, flags=re.I)
+    return htmllib.unescape(TAGS_RE.sub(" ", text))
+
+
+def postal_address(html: str) -> str | None:
+    """Best-effort postal address from microdata, <address>, map links or the page text."""
+    parts: dict = {}
+    for key, content, inner in MICRODATA_RE.findall(html):
+        val = (content or inner).strip()
+        if val and key.lower() not in parts:
+            parts[key.lower()] = val
+    if parts.get("streetaddress") or parts.get("postalcode"):
+        order = ("streetaddress", "addresslocality", "addressregion", "postalcode", "addresscountry")
+        if a := _clean_address(", ".join(parts[k] for k in order if k in parts)):
+            return a
+    for block in ADDRESS_TAG_RE.findall(html):
+        lines = [ln.strip() for ln in TAGS_RE.sub("\n", re.sub(r"<br\s*/?>", "\n", block, flags=re.I)).split("\n")]
+        if a := _clean_address(", ".join(ln for ln in lines if ln and "@" not in ln and not ln.lower().startswith(("tel", "phone", "fax", "email")))):
+            return a[:200]
+    for m in MAPS_RE.findall(html):
+        if a := _clean_address(unquote(m.replace("+", " "))):
+            return a
+    text = visible_text(html)
+    # Find cheap anchors (postcodes, street words) first and run the full pattern only near them
+    for anchor, rx in zip(TEXT_ADDRESS_ANCHORS, TEXT_ADDRESS_RES):
+        for n, am in enumerate(anchor.finditer(text)):
+            if n == 30:
+                break
+            window = text[max(0, am.start() - 220): am.end() + 80]
+            if (m := rx.search(window)) and (a := _clean_address(m.group(0))):
+                return a
+    return None
 
 
 def subpages(html: str, base_url: str) -> dict:
@@ -223,6 +319,8 @@ def extract(html: str, url: str) -> dict:
         **socials(text + " " + org.get("same_as", "")),
         **{k: v for k, v in org.items() if k != "same_as"},
     }
+    if not page.get("org_address"):
+        page["org_address"] = postal_address(html)
     if org.get("jsonld_email") and (e := clean_email(str(org["jsonld_email"]).replace("mailto:", ""))):
         page["emails"] = [e] + [x for x in page["emails"] if x != e]
     if org.get("jsonld_phone") and (p := clean_phone(str(org["jsonld_phone"]))):

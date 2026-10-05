@@ -48,7 +48,9 @@ and collects:
 - title, meta description, site name, language
 - emails (incl. Cloudflare-protected ones) and phone numbers
 - LinkedIn, Facebook, Instagram, X/Twitter, YouTube, TikTok, Pinterest, GitHub, WhatsApp
-- schema.org company data: name, legal name, founding date, address, employees
+- schema.org company data: name, legal name, founding date, employees
+- postal address as one full string (`org_address`), from schema.org data, microdata, the
+  `<address>` tag, Google/Apple Maps links, or address patterns in the page text (US, CA, UK, DE/AT/CH)
 - technologies, detected with 7,000+ open-source Wappalyzer fingerprints from
   [enthec/webappanalyzer](https://github.com/enthec/webappanalyzer) (GPL-3.0, downloaded once to
   `data/webappanalyzer/`). Rules that need a real browser (`js`, `dom`) are skipped.
