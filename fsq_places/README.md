@@ -35,5 +35,5 @@ python export_places.py                 # output/places.csv + output/domains.csv
   (~1M row limit). Open it with DuckDB, Postgres, BigQuery or pandas in chunks.
 - You need ~10 GB of disk for the download plus room for the CSV.
 - In the CSV, list columns (`fsq_category_ids`, `fsq_category_labels`) are joined with ` | `,
-  `geom` is hex-encoded WKB, and `bbox` is written as text. Parquet keeps the original types.
+  `geom` is WKT text (e.g. `POINT (90.4 23.8)`), and `bbox` is written as text. Parquet keeps the original types.
 - `domains.csv` has one row per unique website domain, with how many places use it.

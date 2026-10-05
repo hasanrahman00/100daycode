@@ -49,7 +49,7 @@ def csv_safe_select(con, source: str) -> str:
     for name, dtype, *_ in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{source}')").fetchall():
         q = f'"{name}"'
         if dtype == "BLOB":
-            cols.append(f"hex({q}) AS {q}")  # geom is WKB; hex keeps it lossless
+            cols.append(f"hex({q}) AS {q}")  # raw WKB; hex keeps it lossless
         elif dtype.endswith("[]"):
             cols.append(f"array_to_string({q}, ' | ') AS {q}")
         elif dtype.startswith(("STRUCT", "MAP")):
