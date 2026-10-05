@@ -54,6 +54,11 @@ and collects:
   `data/webappanalyzer/`). Rules that need a real browser (`js`, `dom`) are skipped.
 
 Progress is stored in `output/crawl.db`, so you can stop with Ctrl+C and rerun to resume.
+Results are also appended every 5 seconds to a **live CSV** you can watch while it runs:
+`output/crawl_live.csv`, or `output/crawl_live_shard0of4.csv` etc. when using `--shard`
+(one file per window so they never collide). Only successfully crawled sites are written unless
+you pass `--live-all`. If the file is open in Excel (which locks it), rows are kept in memory and
+written once it's closed.
 
 ```bash
 python company_crawler.py init                 # load domains.csv into output/crawl.db (once)

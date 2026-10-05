@@ -54,6 +54,7 @@ INFO_COLS = ["title", "description", "site_name", "lang", "emails", "phones", *S
              "tech", "tech_categories", "generator",
              "contact_url", "about_url"]
 RESULT_COLS = ["status", "http_status", "final_url", *INFO_COLS, "pages", "error", "crawled_at"]
+LIVE_COLS = ["domain", "country", "places", *RESULT_COLS]
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS sites (
@@ -214,32 +215,63 @@ async def run_crawl(args):
     started = time.time()
     update_sql = f"UPDATE sites SET {', '.join(f'{c}=?' for c in RESULT_COLS)} WHERE domain=?"
 
+    # Live CSV on disk, appended every few seconds; one file per shard so windows don't collide
+    live_path = Path(args.live) if args.live else args.out_dir / (
+        "crawl_live.csv" if shards == 1 else f"crawl_live_shard{shard}of{shards}.csv")
+    live_pending: list = []
+    live_warned = False
+    print(f"Live results file: {live_path.resolve()}")
+
+    def write_live():
+        nonlocal live_warned
+        if not live_pending:
+            return
+        new = not live_path.exists() or live_path.stat().st_size == 0
+        try:
+            with open(live_path, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(LIVE_COLS)
+                w.writerows(live_pending)
+            live_pending.clear()
+            live_warned = False
+        except PermissionError:  # usually the file is open in Excel, which locks it
+            if not live_warned:
+                print(f"  ! Can't write {live_path.name} (open in Excel?). Close it; rows are kept and "
+                      "will be written on the next try.", flush=True)
+                live_warned = True
+
     def flush():
         if results:
-            con.executemany(update_sql, results)
+            con.executemany(update_sql, [row[3:] for row in results])
             con.commit()
+            live_pending.extend(row[:3] + row[3:-1] for row in results
+                               if args.live_all or row[3] == "ok")
             results.clear()
+        write_live()
 
     async def producer():
         last_rowid, sent = 0, 0
         while sent < target:
             rows = con.execute(
-                f"SELECT rowid, domain FROM sites WHERE rowid > ? AND {where} ORDER BY rowid LIMIT 5000",
+                f"SELECT rowid, domain, country, places FROM sites WHERE rowid > ? AND {where} "
+                "ORDER BY rowid LIMIT 5000",
                 [last_rowid, *params],
             ).fetchall()
             if not rows:
                 break
-            for _, domain in rows:
+            for _, domain, country, places in rows:
                 if sent >= target:
                     break
-                await queue.put(domain)
+                await queue.put((domain, country, places))
                 sent += 1
             last_rowid = rows[-1][0]
         for _ in range(args.concurrency):
             await queue.put(None)
 
     async def worker(session):
-        while (domain := await queue.get()) is not None:
+        while (item := await queue.get()) is not None:
+            domain, country, places = item
             try:
                 r = await asyncio.wait_for(crawl_site(session, domain, args), timeout=args.timeout * 4)
             except Exception as e:
@@ -248,9 +280,15 @@ async def run_crawl(args):
             stats[r["status"]] += 1
             stats["with_email"] += bool(r.get("emails"))
             stats["with_linkedin"] += bool(r.get("linkedin"))
-            results.append([r.get(c) for c in RESULT_COLS] + [domain])
+            # [domain, country, places] + result columns + [domain] (last one for the SQL WHERE)
+            results.append([domain, country, places] + [r.get(c) for c in RESULT_COLS] + [domain])
             if len(results) >= 500:
                 flush()
+
+    async def flusher():
+        while True:
+            await asyncio.sleep(5)
+            flush()
 
     async def reporter():
         while True:
@@ -266,11 +304,13 @@ async def run_crawl(args):
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8",
                "Accept-Language": "en", "Accept-Encoding": "gzip, deflate"}
     report = asyncio.create_task(reporter())
+    flushing = asyncio.create_task(flusher())
     try:
         async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
             await asyncio.gather(producer(), *(worker(session) for _ in range(args.concurrency)))
     finally:
         report.cancel()
+        flushing.cancel()
         flush()
         done = sum(stats[s] for s in ("ok", "error", "skipped", "robots"))
         print(f"\nThis run: {done:,} sites, {stats['ok']:,} ok, {stats['with_email']:,} with email, "
@@ -349,6 +389,8 @@ def main():
     s.add_argument("--retry-errors", action="store_true", help="Also retry sites that failed before")
     s.add_argument("--no-robots", action="store_true", help="Don't check robots.txt (faster, less polite)")
     s.add_argument("--no-tech", action="store_true", help="Skip technology detection (faster)")
+    s.add_argument("--live", help="Live CSV to append results to (default: output/crawl_live.csv)")
+    s.add_argument("--live-all", action="store_true", help="Also write failed/skipped sites to the live CSV")
     s.add_argument("--tech-data", default="data/webappanalyzer", help="Where Wappalyzer fingerprints are cached")
     s.set_defaults(func=cmd_crawl)
 
