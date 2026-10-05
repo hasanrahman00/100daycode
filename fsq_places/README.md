@@ -25,6 +25,7 @@ python export_places.py                 # output/places.csv + output/domains.csv
 | `--country US GB` | Keep only these countries |
 | `--open-only` | Drop places with `date_closed` set |
 | `--with-website` | Keep only places that have a website |
+| `--domains-only` | Rebuild only `domains.csv` (skips the big places export) |
 | `--format parquet` | Write `places.parquet` instead (same data, much smaller) |
 | `--release 2025-09-09` | Use a specific release instead of the latest |
 | `--source 'path/*.parquet'` | Skip the download and use local files |

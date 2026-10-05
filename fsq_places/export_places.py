@@ -69,6 +69,8 @@ def main():
     p.add_argument("--open-only", action="store_true", help="Drop places with date_closed set")
     p.add_argument("--with-website", action="store_true", help="Only places that have a website")
     p.add_argument("--schema-only", action="store_true", help="Print the columns and row count, then stop")
+    p.add_argument("--domains-only", action="store_true",
+                   help="Only rebuild domains.csv (skip the big places export)")
     p.add_argument("--source", help="Skip the download and read this local parquet glob instead")
     args = p.parse_args()
 
@@ -106,30 +108,32 @@ def main():
     rows = con.execute("SELECT count(*) FROM places").fetchone()[0]
     print(f"Rows after filters: {rows:,}")
 
-    if args.format == "parquet":
-        out = args.out_dir / "places.parquet"
-        con.execute(f"COPY places TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-    else:
-        out = args.out_dir / "places.csv"
-        select = csv_safe_select(con, source)
-        con.execute(f"COPY (SELECT {select} FROM places) TO '{out}' (FORMAT CSV, HEADER)")
-    print(f"Wrote {out}")
+    if not args.domains_only:
+        if args.format == "parquet":
+            out = args.out_dir / "places.parquet"
+            con.execute(f"COPY places TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        else:
+            out = args.out_dir / "places.csv"
+            select = csv_safe_select(con, source)
+            con.execute(f"COPY (SELECT {select} FROM places) TO '{out}' (FORMAT CSV, HEADER)")
+        print(f"Wrote {out}")
 
     domains = args.out_dir / "domains.csv"
-    con.execute(f"""
-        COPY (
-            SELECT domain, any_value(country) AS country, count(*) AS places
-            FROM (
-                SELECT country, regexp_extract(lower(trim(website)),
-                       '^(?:[a-z]+://)?(?:www\\.)?([^/:?#\\s]+)', 1) AS domain
-                FROM places WHERE website IS NOT NULL
-            )
-            WHERE domain LIKE '%.%'
-            GROUP BY domain
-            ORDER BY places DESC
-        ) TO '{domains}' (FORMAT CSV, HEADER)
+    # Some websites hold several URLs ("a.com,https://b.com"), so stop the host at separators too
+    con.execute(r"""
+        CREATE TEMP TABLE domain_list AS
+        SELECT domain, any_value(country) AS country, count(*) AS places
+        FROM (
+            SELECT country, rtrim(regexp_extract(lower(trim(website, ' "''')),
+                   '^(?:[a-z]+://)?(?:www\.)?([^/:?#\s,;|"''<>]+)', 1), '.') AS domain
+            FROM places WHERE website IS NOT NULL
+        )
+        WHERE domain LIKE '%_._%'
+        GROUP BY domain
+        ORDER BY places DESC
     """)
-    n = con.execute(f"SELECT count(*) FROM read_csv('{domains}')").fetchone()[0]
+    con.execute(f"COPY domain_list TO '{domains}' (FORMAT CSV, HEADER)")
+    n = con.execute("SELECT count(*) FROM domain_list").fetchone()[0]
     print(f"Wrote {domains} ({n:,} unique domains for the LinkedIn crawl)")
 
 
