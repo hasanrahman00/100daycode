@@ -1,8 +1,10 @@
 """Sanity-check the place and domain counts against the raw Foursquare data.
 
 Usage:
-    python check_counts.py
+    python check_counts.py   # also checks output/companies.csv if it exists
 """
+from pathlib import Path
+
 import duckdb
 
 con = duckdb.connect()
@@ -28,3 +30,12 @@ print(con.sql("""
     FROM read_csv('output/domains.csv', header=true, quote='"')
     ORDER BY places DESC LIMIT 15
 """))
+
+if Path("output/companies.csv").exists():
+    print("companies.csv (should match unique_domains above):")
+    print(con.sql("""
+        SELECT count(*) AS rows, count(DISTINCT domain) AS unique_domains,
+               sum(CASE WHEN likely_directory THEN 1 ELSE 0 END) AS likely_directory,
+               count(website) AS with_website, count(tel) AS with_phone, count(email) AS with_email
+        FROM read_csv('output/companies.csv', header=true, quote='"')
+    """))

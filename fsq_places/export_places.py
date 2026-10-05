@@ -98,6 +98,8 @@ def export_companies(con, source: str, out_dir: Path, fmt: str):
     rows for just those ids, so memory stays low even with 33M places that have a website.
     """
     con.execute("SET preserve_insertion_order = false")  # lets DuckDB spill big work to disk
+    # A scratch folder per run, so deleting a shared .tmp can't break this one mid-way
+    con.execute(f"SET temp_directory = '{out_dir / f'duckdb_tmp_{os.getpid()}'}'")
     print("Step 1/3: choosing one place per domain...", flush=True)
     con.execute(f"""
         CREATE TEMP TABLE winners AS
@@ -125,9 +127,9 @@ def export_companies(con, source: str, out_dir: Path, fmt: str):
     """
     out = out_dir / f"companies.{'parquet' if fmt == 'parquet' else 'csv'}"
     options = "FORMAT PARQUET, COMPRESSION ZSTD" if fmt == "parquet" else "FORMAT CSV, HEADER"
-    con.execute(f"COPY ({query}) TO '{out}' ({options})")
     n = con.execute("SELECT count(*) FROM winners").fetchone()[0]
     d = con.execute("SELECT count(*) FROM directories").fetchone()[0]
+    con.execute(f"COPY ({query}) TO '{out}' ({options})")
     print(f"Wrote {out} ({n:,} unique domains, {d:,} flagged likely_directory)")
 
 
