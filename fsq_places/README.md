@@ -77,7 +77,7 @@ Statuses: `ok`, `robots` (site disallows crawling), `skipped` (social/booking pl
 `error` (dead or unreachable).
 
 **Directory sites:** some businesses list a directory page as their website (e.g. `gelbeseiten.de`,
-244k German places). a domain with 20+ places where under 20% of place names contain the domain's brand gets
+244k German places). A domain with 20+ places where under 20% of place names contain the domain's brand gets
 `likely_directory = true` in `companies.csv`, and `join` leaves its `site_*` columns empty so the
 directory's own emails and social links aren't given to the businesses it lists. Chains like
 `walmart.com` are kept.
