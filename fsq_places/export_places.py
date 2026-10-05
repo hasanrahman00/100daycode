@@ -21,6 +21,9 @@ import duckdb
 from huggingface_hub import HfApi, snapshot_download
 
 REPO_ID = "foursquare/fsq-os-places"
+# Website -> bare host. Some websites hold several URLs ("a.com,https://b.com"), so stop at separators too
+DOMAIN_SQL = r"""rtrim(regexp_extract(lower(trim(website, ' "''')),
+    '^(?:[a-z]+://)?(?:www\.)?([^/:?#\s,;|"''<>]+)', 1), '.')"""
 RELEASE_RE = re.compile(r"release/dt=(\d{4}-\d{2}-\d{2})/places/parquet/")
 
 
@@ -119,15 +122,10 @@ def main():
         print(f"Wrote {out}")
 
     domains = args.out_dir / "domains.csv"
-    # Some websites hold several URLs ("a.com,https://b.com"), so stop the host at separators too
-    con.execute(r"""
+    con.execute(f"""
         CREATE TEMP TABLE domain_list AS
         SELECT domain, any_value(country) AS country, count(*) AS places
-        FROM (
-            SELECT country, rtrim(regexp_extract(lower(trim(website, ' "''')),
-                   '^(?:[a-z]+://)?(?:www\.)?([^/:?#\s,;|"''<>]+)', 1), '.') AS domain
-            FROM places WHERE website IS NOT NULL
-        )
+        FROM (SELECT country, {DOMAIN_SQL} AS domain FROM places WHERE website IS NOT NULL)
         WHERE domain LIKE '%_._%'
         GROUP BY domain
         ORDER BY places DESC
