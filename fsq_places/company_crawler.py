@@ -8,7 +8,8 @@ the website's technologies (7,000+ open-source Wappalyzer fingerprints: CMS,
 ecommerce, analytics, marketing tools, servers, frameworks...).
 
 Progress lives in SQLite (output/crawl.db): stop with Ctrl+C any time and rerun the
-same command to resume. Run several copies with --shard to use more CPU cores.
+same command to resume. Page analysis runs on all CPU cores automatically; --shard
+is only needed to split the work across several machines.
 
 Usage:
     python company_crawler.py init                      # load domains.csv (once)
@@ -22,11 +23,12 @@ Usage:
 import argparse
 import asyncio
 import csv
+import os
 import sqlite3
 import sys
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urljoin
 from urllib.robotparser import RobotFileParser
@@ -151,47 +153,82 @@ async def robots_allows(session, base_url) -> bool:
     return rp.can_fetch(USER_AGENT, base_url)
 
 
-async def crawl_site(session, domain, args) -> dict:
+# ---------------------------------------------------------------- page analysis (worker processes)
+# Parsing and technology matching are CPU work. They run in a process pool so the download loop
+# never stalls on a heavy page, and so every CPU core is used.
+
+_DETECTOR: Detector | None = None
+
+
+def _init_worker(tech_data: str | None):
+    global _DETECTOR
+    _DETECTOR = Detector(Path(tech_data)) if tech_data else None
+
+
+def analyze_home(html: str, url: str, headers: dict, cookies: dict):
+    home = extract(html, url)
+    techs = _DETECTOR.detect(html, url, headers, cookies) if _DETECTOR else {}
+    return home, techs, (_DETECTOR.categories(techs) if _DETECTOR else [])
+
+
+def analyze_sub(html: str, url: str):
+    return extract(html, url)
+
+
+# ---------------------------------------------------------------- fetching one site
+
+async def crawl_site(session, domain, args, pool) -> dict:
     if is_skipped(domain):
         return {"status": "skipped"}
+    loop = asyncio.get_running_loop()
     last_error, status_code = None, None
     for scheme in ("https", "http"):
         base = f"{scheme}://{domain}/"
+        # robots.txt and the homepage are fetched at the same time
+        robots = None if args.no_robots else asyncio.create_task(robots_allows(session, base))
         try:
-            if not args.no_robots and not await robots_allows(session, base):
-                return {"status": "robots", "final_url": base}
             status_code, final_url, html, headers, cookies = await fetch(session, base)
+        except asyncio.TimeoutError:
+            if robots:
+                robots.cancel()
+            last_error = "Timeout"
+            break  # a site that times out on https almost never answers on http either
         except Exception as e:
+            if robots:
+                robots.cancel()
             last_error = f"{type(e).__name__}: {e}"[:200]
             continue
+        if robots and not await robots:
+            return {"status": "robots", "final_url": base}
         if html is None:
             last_error = f"HTTP {status_code}"
             continue
-        home = extract(html, final_url)
-        techs = DETECTOR.detect(html, final_url, headers, cookies) if DETECTOR else {}
-        pages = [home]
-        for kind in ("contact", "about")[: max(args.max_pages - 1, 0)]:
-            url = home["links"].get(kind)
-            if not url or url.rstrip("/") == final_url.rstrip("/"):
-                continue
+        home, techs, cats = await loop.run_in_executor(pool, analyze_home, html, final_url, headers, cookies)
+
+        # contact and about pages are fetched at the same time
+        sub_urls = [u for kind in ("contact", "about")[: max(args.max_pages - 1, 0)]
+                    if (u := home["links"].get(kind)) and u.rstrip("/") != final_url.rstrip("/")]
+
+        async def sub_page(url):
             try:
                 _, sub_url, sub_html, _, _ = await fetch(session, url)
             except Exception:
-                continue
-            if sub_html:
-                pages.append(extract(sub_html, sub_url))
+                return None
+            return await loop.run_in_executor(pool, analyze_sub, sub_html, sub_url) if sub_html else None
+
+        pages = [home] + [p for p in await asyncio.gather(*(sub_page(u) for u in sub_urls)) if p]
         info = merge(pages, domain)
         return {
             "status": "ok", "http_status": status_code, "final_url": final_url, "pages": len(pages),
             "contact_url": home["links"].get("contact"), "about_url": home["links"].get("about"),
             "tech": " | ".join(f"{n} {v}".strip() for n, v in sorted(techs.items())) or None,
-            "tech_categories": (" | ".join(DETECTOR.categories(techs)) or None) if DETECTOR else None,
+            "tech_categories": " | ".join(cats) or None,
             **{k: (" | ".join(map(str, v)) if isinstance(v, list) else v) for k, v in info.items()},
         }
     return {"status": "error", "http_status": status_code, "error": last_error}
 
 
-async def run_crawl(args):
+async def run_crawl(args, pool):
     con = connect(args.db)
     where = "(status IS NULL OR status = 'error')" if args.retry_errors else "status IS NULL"
     params: list = []
@@ -273,7 +310,7 @@ async def run_crawl(args):
         while (item := await queue.get()) is not None:
             domain, country, places = item
             try:
-                r = await asyncio.wait_for(crawl_site(session, domain, args), timeout=args.timeout * 4)
+                r = await asyncio.wait_for(crawl_site(session, domain, args, pool), timeout=args.timeout * 3)
             except Exception as e:
                 r = {"status": "error", "error": type(e).__name__}
             r["crawled_at"] = int(time.time())
@@ -299,8 +336,9 @@ async def run_crawl(args):
             print(f"  {done:,}/{target:,}  {rate:.0f}/s  ok={stats['ok']:,}  email={stats['with_email']:,}  "
                   f"linkedin={stats['with_linkedin']:,}  error={stats['error']:,}  ETA {eta:.1f}h", flush=True)
 
-    timeout = aiohttp.ClientTimeout(total=args.timeout, connect=min(args.timeout, 8))
-    connector = aiohttp.TCPConnector(limit=args.concurrency, limit_per_host=2, ttl_dns_cache=300, ssl=False)
+    timeout = aiohttp.ClientTimeout(total=args.timeout, connect=min(args.timeout, 5))
+    # up to ~3 requests per site run at once (robots + homepage, then contact + about)
+    connector = aiohttp.TCPConnector(limit=args.concurrency * 3, limit_per_host=3, ttl_dns_cache=300, ssl=False)
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8",
                "Accept-Language": "en", "Accept-Encoding": "gzip, deflate"}
     report = asyncio.create_task(reporter())
@@ -317,21 +355,18 @@ async def run_crawl(args):
               f"{stats['with_linkedin']:,} with LinkedIn. Run 'stats' for totals.")
 
 
-DETECTOR: Detector | None = None
-
-
 def cmd_crawl(args):
-    global DETECTOR
-    if not args.no_tech:
-        DETECTOR = Detector(Path(args.tech_data))
-        print(f"Technology detection: {len(DETECTOR.techs):,} fingerprints loaded")
-    try:
-        asyncio.run(run_crawl(args))
-    except KeyboardInterrupt:
-        print("\nStopped. Progress is saved; run the same command to resume.")
+    workers = args.workers or max(1, (os.cpu_count() or 2) - 1)
+    tech_data = None if args.no_tech else args.tech_data
+    if tech_data:
+        Detector(Path(tech_data))  # download fingerprints once, before the workers start
+    print(f"Page analysis on {workers} CPU worker(s); technology detection {'on' if tech_data else 'off'}")
+    with ProcessPoolExecutor(workers, initializer=_init_worker, initargs=(tech_data,)) as pool:
+        try:
+            asyncio.run(run_crawl(args, pool))
+        except KeyboardInterrupt:
+            print("\nStopped. Progress is saved; run the same command to resume.")
 
-
-# ---------------------------------------------------------------- output
 
 def cmd_export(args):
     con = connect(args.db)
@@ -380,8 +415,9 @@ def main():
     s.set_defaults(func=cmd_init)
 
     s = sub.add_parser("crawl", help="Crawl pending sites (resumable)")
-    s.add_argument("--concurrency", type=int, default=200, help="Sites fetched at the same time")
-    s.add_argument("--timeout", type=int, default=15, help="Seconds per request")
+    s.add_argument("--concurrency", type=int, default=500, help="Sites fetched at the same time")
+    s.add_argument("--timeout", type=int, default=10, help="Seconds per request")
+    s.add_argument("--workers", type=int, help="CPU processes for page analysis (default: cores - 1)")
     s.add_argument("--max-pages", type=int, default=3, help="Pages per site: homepage + contact + about")
     s.add_argument("--limit", type=int, help="Stop after this many sites (for test runs)")
     s.add_argument("--country", nargs="*", help="Only sites from these countries, e.g. US GB")
