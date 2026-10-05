@@ -6,10 +6,12 @@ Usage:
     python export_places.py                       # every row, every column -> output/places.csv
     python export_places.py --country US --open-only --with-website
     python export_places.py --format parquet      # same data, ~5x smaller file
+    python export_places.py --companies           # one row per unique website domain -> output/companies.csv
 
 Outputs (in ./output):
     places.csv  (or places.parquet)   one file, all rows, all columns
     domains.csv                       unique website domains for the LinkedIn crawl
+    companies.csv                     (--companies) one row per domain, all columns
 """
 import argparse
 import os
@@ -46,6 +48,32 @@ def download(release: str, data_dir: Path, token: str) -> str:
     return str(data_dir / f"release/dt={release}/places/parquet/*.parquet")
 
 
+def directory_sql(rows: str, min_places: int = 20, min_brand_share: float = 0.2) -> str:
+    """Domains that look like directories (gelbeseiten.de) rather than one company's site.
+
+    `rows` is a FROM target with `domain` and `name` columns. Chains (walmart.com) pass because
+    most of their place names contain the domain's brand; directory listings don't.
+    """
+    return f"""
+        WITH labeled AS (
+            SELECT domain, name, string_split(domain, '.') AS parts FROM {rows}
+        ), branded AS (
+            SELECT domain, name,
+                   regexp_replace(CASE
+                       WHEN len(parts) >= 3 AND parts[len(parts) - 1] IN
+                            ('co', 'com', 'org', 'net', 'gov', 'edu', 'ac', 'or', 'ne', 'go', 'gob')
+                       THEN parts[len(parts) - 2] ELSE parts[len(parts) - 1] END, '[^a-z0-9]', '', 'g') AS brand
+            FROM labeled
+        )
+        SELECT domain, count(*) AS places,
+               avg(CASE WHEN contains(regexp_replace(lower(name), '[^a-z0-9]', '', 'g'), brand)
+                        THEN 1 ELSE 0 END) AS brand_share
+        FROM branded
+        GROUP BY domain
+        HAVING count(*) >= {min_places} AND brand_share < {min_brand_share}
+    """
+
+
 def csv_safe_select(con, source: str) -> str:
     """CSV can't hold lists, structs or binary, so turn those columns into text. Every column is kept."""
     cols = []
@@ -62,6 +90,40 @@ def csv_safe_select(con, source: str) -> str:
     return ", ".join(cols)
 
 
+def export_companies(con, source: str, out_dir: Path, fmt: str):
+    """One row per unique website domain. For chains, keep the most useful location:
+    open first, then without Foursquare quality flags, then the most recently refreshed."""
+    con.execute("SET preserve_insertion_order = false")  # lets DuckDB spill big sorts to disk
+    con.execute(f"""
+        CREATE TEMP TABLE ranked AS
+        SELECT *, count(*) OVER w AS domain_places,
+               row_number() OVER (w ORDER BY date_closed IS NULL DESC,
+                                             coalesce(len(unresolved_flags), 0) = 0 DESC,
+                                             date_refreshed DESC NULLS LAST,
+                                             fsq_place_id) AS rn
+        FROM (SELECT *, {DOMAIN_SQL} AS domain FROM places WHERE website IS NOT NULL)
+        WHERE domain LIKE '%_._%'
+        WINDOW w AS (PARTITION BY domain)
+    """)
+    con.execute(f"CREATE TEMP TABLE directories AS {directory_sql('ranked')}")
+    columns = "* EXCLUDE (domain, domain_places, rn)" if fmt == "parquet" else csv_safe_select(con, source)
+    query = f"""
+        SELECT {columns},
+               domain, domain_places, domain IN (SELECT domain FROM directories) AS likely_directory
+        FROM ranked WHERE rn = 1
+        ORDER BY domain_places DESC
+    """
+    if fmt == "parquet":
+        out = out_dir / "companies.parquet"
+        con.execute(f"COPY ({query}) TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+    else:
+        out = out_dir / "companies.csv"
+        con.execute(f"COPY ({query}) TO '{out}' (FORMAT CSV, HEADER)")
+    n = con.execute("SELECT count(*) FROM ranked WHERE rn = 1").fetchone()[0]
+    d = con.execute("SELECT count(*) FROM directories").fetchone()[0]
+    print(f"Wrote {out} ({n:,} unique domains, {d:,} flagged likely_directory)")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--release", help="dt=YYYY-MM-DD release to use (default: latest)")
@@ -74,6 +136,8 @@ def main():
     p.add_argument("--schema-only", action="store_true", help="Print the columns and row count, then stop")
     p.add_argument("--domains-only", action="store_true",
                    help="Only rebuild domains.csv (skip the big places export)")
+    p.add_argument("--companies", action="store_true",
+                   help="Only write companies.csv: one row per unique website domain, all columns")
     p.add_argument("--source", help="Skip the download and read this local parquet glob instead")
     args = p.parse_args()
 
@@ -110,6 +174,10 @@ def main():
     con.execute(f"CREATE VIEW places AS SELECT * FROM read_parquet('{source}') WHERE {where_sql}")
     rows = con.execute("SELECT count(*) FROM places").fetchone()[0]
     print(f"Rows after filters: {rows:,}")
+
+    if args.companies:
+        export_companies(con, source, args.out_dir, args.format)
+        return
 
     if not args.domains_only:
         if args.format == "parquet":

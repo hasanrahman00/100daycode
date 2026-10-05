@@ -300,7 +300,7 @@ def cmd_export(args):
 
 def cmd_join(args):
     import duckdb
-    from export_places import DOMAIN_SQL, csv_safe_select
+    from export_places import DOMAIN_SQL, csv_safe_select, directory_sql
 
     cmd_export(args)
     linkedin = args.out_dir / "linkedin.csv"
@@ -320,23 +320,7 @@ def cmd_join(args):
     # Chains (walmart.com) are told apart because most of their place names contain the brand.
     con.execute(f"""
         CREATE TEMP TABLE directories AS
-        WITH labeled AS (
-            SELECT domain, name, string_split(domain, '.') AS parts
-            FROM p WHERE domain IN (SELECT domain FROM l)
-        ), branded AS (
-            SELECT domain, name,
-                   regexp_replace(CASE
-                       WHEN len(parts) >= 3 AND parts[len(parts) - 1] IN
-                            ('co', 'com', 'org', 'net', 'gov', 'edu', 'ac', 'or', 'ne', 'go', 'gob')
-                       THEN parts[len(parts) - 2] ELSE parts[len(parts) - 1] END, '[^a-z0-9]', '', 'g') AS brand
-            FROM labeled
-        )
-        SELECT domain, count(*) AS places,
-               avg(CASE WHEN contains(regexp_replace(lower(name), '[^a-z0-9]', '', 'g'), brand)
-                        THEN 1 ELSE 0 END) AS brand_share
-        FROM branded
-        GROUP BY domain
-        HAVING count(*) >= {args.min_places} AND brand_share < {args.min_brand_share}
+        {directory_sql("p WHERE domain IN (SELECT domain FROM l)", args.min_places, args.min_brand_share)}
     """)
     dirs = con.execute("SELECT domain, places, brand_share FROM directories ORDER BY places DESC").fetchall()
     if dirs:
