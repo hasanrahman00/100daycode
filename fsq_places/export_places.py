@@ -122,7 +122,6 @@ def export_companies(con, source: str, out_dir: Path, fmt: str):
         SELECT {columns}, w.domain, w.domain_places,
                w.domain IN (SELECT domain FROM directories) AS likely_directory
         FROM read_parquet('{source}') p JOIN winners w USING (fsq_place_id)
-        ORDER BY w.domain_places DESC
     """
     out = out_dir / f"companies.{'parquet' if fmt == 'parquet' else 'csv'}"
     options = "FORMAT PARQUET, COMPRESSION ZSTD" if fmt == "parquet" else "FORMAT CSV, HEADER"
