@@ -40,33 +40,44 @@ python export_places.py                 # output/places.csv + output/domains.csv
   `geom` is WKT text (e.g. `POINT (90.4 23.8)`), and `bbox` is written as text. Parquet keeps the original types.
 - `domains.csv` has one row per unique website domain, with how many places use it.
 
-## LinkedIn crawler
+## Company website crawler
 
-`linkedin_crawler.py` visits each domain in `domains.csv` and saves the `linkedin.com/company/...`
-link it finds on the homepage (or on up to two about/contact pages). Progress is stored in
-`output/crawl.db`, so you can stop with Ctrl+C and rerun the same command to resume.
+`company_crawler.py` visits each domain in `domains.csv` (homepage, then contact and about pages)
+and collects:
+
+- title, meta description, site name, language
+- emails (incl. Cloudflare-protected ones) and phone numbers
+- LinkedIn, Facebook, Instagram, X/Twitter, YouTube, TikTok, Pinterest, GitHub, WhatsApp
+- schema.org company data: name, legal name, founding date, address, employees
+- technologies, detected with 7,000+ open-source Wappalyzer fingerprints from
+  [enthec/webappanalyzer](https://github.com/enthec/webappanalyzer) (GPL-3.0, downloaded once to
+  `data/webappanalyzer/`). Rules that need a real browser (`js`, `dom`) are skipped.
+
+Progress is stored in `output/crawl.db`, so you can stop with Ctrl+C and rerun to resume.
 
 ```bash
-python linkedin_crawler.py init                 # load domains.csv into output/crawl.db (once)
-python linkedin_crawler.py crawl --limit 1000   # test run
-python linkedin_crawler.py crawl                # full run (resumable)
-python linkedin_crawler.py stats                # progress and hit rate
-python linkedin_crawler.py export               # output/linkedin.csv: domain -> linkedin_url
-python linkedin_crawler.py join                 # output/places_with_linkedin.csv: all FSQ columns + linkedin_url
+python company_crawler.py init                 # load domains.csv into output/crawl.db (once)
+python company_crawler.py crawl --limit 1000   # test run
+python company_crawler.py crawl                # full run (resumable)
+python company_crawler.py stats                # progress, field coverage, speed and ETA
+python company_crawler.py join --companies path/to/companies.csv   # output/companies_enriched.csv
 ```
 
 | Crawl flag | Effect |
 |---|---|
-| `--concurrency 300` | Sites fetched at the same time; raise it on a fast server |
+| `--concurrency 200` | Sites fetched at the same time per window |
+| `--shard 0/4` | Split the work over several windows/cores: run `0/4`, `1/4`, `2/4`, `3/4` |
+| `--max-pages 3` | Pages per site: homepage + contact + about |
 | `--country US GB` | Only crawl domains from these countries |
-| `--timeout 15` | Seconds per request |
-| `--retry-errors` | Also retry domains that failed before |
+| `--retry-errors` | Also retry sites that failed before |
 | `--no-robots` | Skip the robots.txt check (faster, less polite) |
+| `--no-tech` | Skip technology detection (faster) |
 
-Statuses in `crawl.db`: `found`, `none` (site works, no LinkedIn link), `robots` (site disallows
-crawling), `skipped` (social/booking platforms, not a company site), `error` (dead or unreachable).
+Statuses: `ok`, `robots` (site disallows crawling), `skipped` (social/booking platforms),
+`error` (dead or unreachable).
 
 **Directory sites:** some businesses list a directory page as their website (e.g. `gelbeseiten.de`,
-244k German places). `join` won't give those businesses the directory's own LinkedIn page: a domain
-with 20+ places where under 20% of place names contain the domain's brand is treated as a
-directory and listed in `output/directory_domains.csv`. Chains like `walmart.com` keep their link.
+244k German places). a domain with 20+ places where under 20% of place names contain the domain's brand gets
+`likely_directory = true` in `companies.csv`, and `join` leaves its `site_*` columns empty so the
+directory's own emails and social links aren't given to the businesses it lists. Chains like
+`walmart.com` are kept.
