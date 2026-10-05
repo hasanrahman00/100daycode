@@ -92,34 +92,42 @@ def csv_safe_select(con, source: str) -> str:
 
 def export_companies(con, source: str, out_dir: Path, fmt: str):
     """One row per unique website domain. For chains, keep the most useful location:
-    open first, then without Foursquare quality flags, then the most recently refreshed."""
-    con.execute("SET preserve_insertion_order = false")  # lets DuckDB spill big sorts to disk
-    con.execute(f"""
-        CREATE TEMP TABLE ranked AS
-        SELECT *, count(*) OVER w AS domain_places,
-               row_number() OVER (w ORDER BY date_closed IS NULL DESC,
-                                             coalesce(len(unresolved_flags), 0) = 0 DESC,
-                                             date_refreshed DESC NULLS LAST,
-                                             fsq_place_id) AS rn
-        FROM (SELECT *, {DOMAIN_SQL} AS domain FROM places WHERE website IS NOT NULL)
-        WHERE domain LIKE '%_._%'
-        WINDOW w AS (PARTITION BY domain)
-    """)
-    con.execute(f"CREATE TEMP TABLE directories AS {directory_sql('ranked')}")
-    columns = "* EXCLUDE (domain, domain_places, rn)" if fmt == "parquet" else csv_safe_select(con, source)
-    query = f"""
-        SELECT {columns},
-               domain, domain_places, domain IN (SELECT domain FROM directories) AS likely_directory
-        FROM ranked WHERE rn = 1
-        ORDER BY domain_places DESC
+    open first, then without Foursquare quality flags, then the most recently refreshed.
+
+    Picks the winning place id per domain from a few small columns, then reads the full
+    rows for just those ids, so memory stays low even with 33M places that have a website.
     """
-    if fmt == "parquet":
-        out = out_dir / "companies.parquet"
-        con.execute(f"COPY ({query}) TO '{out}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-    else:
-        out = out_dir / "companies.csv"
-        con.execute(f"COPY ({query}) TO '{out}' (FORMAT CSV, HEADER)")
-    n = con.execute("SELECT count(*) FROM ranked WHERE rn = 1").fetchone()[0]
+    con.execute("SET preserve_insertion_order = false")  # lets DuckDB spill big work to disk
+    print("Step 1/3: choosing one place per domain...", flush=True)
+    con.execute(f"""
+        CREATE TEMP TABLE winners AS
+        SELECT domain, count(*) AS domain_places,
+               arg_max(fsq_place_id, {{'open': date_closed IS NULL,
+                                       'unflagged': coalesce(len(unresolved_flags), 0) = 0,
+                                       'refreshed': coalesce(date_refreshed, '')}}) AS fsq_place_id
+        FROM (SELECT fsq_place_id, date_closed, unresolved_flags, date_refreshed, {DOMAIN_SQL} AS domain
+              FROM places WHERE website IS NOT NULL)
+        WHERE domain LIKE '%_._%'
+        GROUP BY domain
+    """)
+    print("Step 2/3: finding directory sites...", flush=True)
+    con.execute(f"""
+        CREATE TEMP TABLE directories AS
+        {directory_sql(f"(SELECT name, {DOMAIN_SQL} AS domain FROM places WHERE website IS NOT NULL "
+                       "AND domain IN (SELECT domain FROM winners WHERE domain_places >= 20))")}
+    """)
+    print("Step 3/3: writing the file...", flush=True)
+    columns = "p.*" if fmt == "parquet" else csv_safe_select(con, source)
+    query = f"""
+        SELECT {columns}, w.domain, w.domain_places,
+               w.domain IN (SELECT domain FROM directories) AS likely_directory
+        FROM read_parquet('{source}') p JOIN winners w USING (fsq_place_id)
+        ORDER BY w.domain_places DESC
+    """
+    out = out_dir / f"companies.{'parquet' if fmt == 'parquet' else 'csv'}"
+    options = "FORMAT PARQUET, COMPRESSION ZSTD" if fmt == "parquet" else "FORMAT CSV, HEADER"
+    con.execute(f"COPY ({query}) TO '{out}' ({options})")
+    n = con.execute("SELECT count(*) FROM winners").fetchone()[0]
     d = con.execute("SELECT count(*) FROM directories").fetchone()[0]
     print(f"Wrote {out} ({n:,} unique domains, {d:,} flagged likely_directory)")
 
