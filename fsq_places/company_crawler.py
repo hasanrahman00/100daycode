@@ -123,7 +123,13 @@ def connect(db: Path) -> sqlite3.Connection:
 # ---------------------------------------------------------------- setup and progress
 
 def cmd_init(args):
+    if args.replace:
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(args.db) + suffix).unlink(missing_ok=True)
     con = connect(args.db)
+    # Bulk load: skip the per-commit disk syncs (safe here: if it crashes, just run init again)
+    con.execute("PRAGMA synchronous=OFF")
+    con.execute("PRAGMA cache_size=-500000")  # ~500 MB page cache
     t = time.time()
     total = 0
     with open(args.domains, newline="", encoding="utf-8") as f:
@@ -428,8 +434,17 @@ async def crawl_site(session, domain, args, pool) -> dict:
     loop = asyncio.get_running_loop()
     proxy = PROXIES.pick() if PROXIES else None  # one proxy per site keeps its pages consistent
     last_error, status_code = None, None
-    for scheme in ("https", "http"):
-        base = f"{scheme}://{domain}/"
+    # some companies only set up www.example.com, so try it when the bare domain doesn't resolve
+    attempts = [("https", domain), ("http", domain)]
+    if not domain.startswith("www.") and ":" not in domain:
+        attempts += [("https", "www." + domain), ("http", "www." + domain)]
+    dns_failed: set = set()
+    for scheme, host in attempts:
+        if host in dns_failed:
+            continue
+        if host != domain and domain not in dns_failed:
+            break  # the bare domain resolved, so www. won't help
+        base = f"{scheme}://{host}/"
         # robots.txt and the homepage are fetched at the same time
         robots = None if args.no_robots else asyncio.create_task(robots_allows(session, base, proxy))
         try:
@@ -444,7 +459,7 @@ async def crawl_site(session, domain, args, pool) -> dict:
                 robots.cancel()
             last_error = f"{type(e).__name__}: {e}"[:200]
             if classify_error(e) == "dns":
-                break  # the domain doesn't resolve; http:// would fail the same way
+                dns_failed.add(host)  # http:// would fail the same way
             continue
         if robots and not await robots:
             return {"status": "robots", "final_url": base}
@@ -850,6 +865,7 @@ def main():
 
     s = sub.add_parser("init", help="Load domains.csv into the crawl database")
     s.add_argument("--domains", type=Path, default=Path("output/domains.csv"))
+    s.add_argument("--replace", action="store_true", help="Delete the existing crawl database first (fresh start)")
     s.set_defaults(func=cmd_init)
 
     s = sub.add_parser("crawl", help="Crawl pending sites (resumable)")

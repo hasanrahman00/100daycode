@@ -2,3 +2,4 @@ huggingface_hub>=0.24
 duckdb>=1.1
 aiohttp>=3.9
 dnspython>=2.6
+tldextract>=5.1

@@ -14,6 +14,7 @@ Outputs (in ./output):
     companies.csv                     (--companies) one row per domain, all columns
 """
 import argparse
+import csv
 import os
 import re
 import sys
@@ -90,9 +91,40 @@ def csv_safe_select(con, source: str) -> str:
     return ", ".join(cols)
 
 
+def add_site_places(con, out_dir: Path, keep_subdomains: bool = False):
+    """View `site_places`: every place with a website plus `host` (www stripped) and `domain`.
+    `domain` is the company's main domain (locations.pizzahut.com -> pizzahut.com), keeping the
+    subdomain for website builders and government sites (see domain_root.py)."""
+    host_sql = f"SELECT *, {DOMAIN_SQL} AS host FROM places WHERE website IS NOT NULL"
+    if keep_subdomains:
+        con.execute(f"CREATE VIEW site_places AS SELECT *, host AS domain FROM ({host_sql}) WHERE host LIKE '%_._%'")
+        return
+    from domain_root import root_domain
+
+    print("Mapping website hosts to main domains (a few minutes)...", flush=True)
+    path = out_dir / "host_roots.csv"
+    cur = con.execute(f"SELECT DISTINCT host FROM ({host_sql}) WHERE host LIKE '%_._%'")
+    n = changed = 0
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["host", "root"])
+        while batch := cur.fetchmany(200_000):
+            for (host,) in batch:
+                root = root_domain(host) or host
+                changed += root != host
+                w.writerow([host, root])
+            n += len(batch)
+            print(f"\r  {n:,} hosts", end="", flush=True)
+    print(f"\r  {n:,} hosts, {changed:,} were subdomains mapped to their main domain")
+    con.execute(f"""CREATE TEMP TABLE host_roots AS SELECT * FROM read_csv('{path}', header=true, quote='"',
+                    columns={{'host': 'VARCHAR', 'root': 'VARCHAR'}})""")
+    con.execute(f"CREATE VIEW site_places AS SELECT p.*, r.root AS domain FROM ({host_sql}) p JOIN host_roots r USING (host)")
+
+
 def export_companies(con, source: str, out_dir: Path, fmt: str):
     """One row per unique website domain. For chains, keep the most useful location:
-    open first, then without Foursquare quality flags, then the most recently refreshed.
+    open first, then without Foursquare quality flags, then one whose website is the main domain
+    itself (not a store-locator subdomain), then the most recently refreshed.
 
     Picks the winning place id per domain from a few small columns, then reads the full
     rows for just those ids, so memory stays low even with 33M places that have a website.
@@ -101,22 +133,21 @@ def export_companies(con, source: str, out_dir: Path, fmt: str):
     # A scratch folder per run, so deleting a shared .tmp can't break this one mid-way
     con.execute(f"SET temp_directory = '{out_dir / f'duckdb_tmp_{os.getpid()}'}'")
     print("Step 1/3: choosing one place per domain...", flush=True)
-    con.execute(f"""
+    con.execute("""
         CREATE TEMP TABLE winners AS
         SELECT domain, count(*) AS domain_places,
-               arg_max(fsq_place_id, {{'open': date_closed IS NULL,
-                                       'unflagged': coalesce(len(unresolved_flags), 0) = 0,
-                                       'refreshed': coalesce(date_refreshed, '')}}) AS fsq_place_id
-        FROM (SELECT fsq_place_id, date_closed, unresolved_flags, date_refreshed, {DOMAIN_SQL} AS domain
-              FROM places WHERE website IS NOT NULL)
-        WHERE domain LIKE '%_._%'
+               arg_max(fsq_place_id, {'open': date_closed IS NULL,
+                                      'unflagged': coalesce(len(unresolved_flags), 0) = 0,
+                                      'main_site': host = domain,
+                                      'refreshed': coalesce(date_refreshed, '')}) AS fsq_place_id
+        FROM site_places
         GROUP BY domain
     """)
     print("Step 2/3: finding directory sites...", flush=True)
     con.execute(f"""
         CREATE TEMP TABLE directories AS
-        {directory_sql(f"(SELECT name, {DOMAIN_SQL} AS domain FROM places WHERE website IS NOT NULL "
-                       "AND domain IN (SELECT domain FROM winners WHERE domain_places >= 20))")}
+        {directory_sql("(SELECT name, domain FROM site_places "
+                       "WHERE domain IN (SELECT domain FROM winners WHERE domain_places >= 20))")}
     """)
     print("Step 3/3: writing the file...", flush=True)
     columns = "p.*" if fmt == "parquet" else csv_safe_select(con, source)
@@ -148,6 +179,8 @@ def main():
     p.add_argument("--companies", action="store_true",
                    help="Only write companies.csv: one row per unique website domain, all columns")
     p.add_argument("--source", help="Skip the download and read this local parquet glob instead")
+    p.add_argument("--keep-subdomains", action="store_true",
+                   help="Use each website host as is (default: main domain, e.g. locations.x.com -> x.com)")
     args = p.parse_args()
 
     if args.source:
@@ -184,6 +217,7 @@ def main():
     rows = con.execute("SELECT count(*) FROM places").fetchone()[0]
     print(f"Rows after filters: {rows:,}")
 
+    add_site_places(con, args.out_dir, args.keep_subdomains)
     if args.companies:
         export_companies(con, source, args.out_dir, args.format)
         return
@@ -199,13 +233,12 @@ def main():
         print(f"Wrote {out}")
 
     domains = args.out_dir / "domains.csv"
-    con.execute(f"""
+    con.execute("""
         CREATE TEMP TABLE domain_list AS
-        SELECT domain, any_value(country) AS country, count(*) AS places
-        FROM (SELECT country, {DOMAIN_SQL} AS domain FROM places WHERE website IS NOT NULL)
-        WHERE domain LIKE '%_._%'
+        SELECT domain, any_value(country) AS country, count(*) AS places, count(DISTINCT host) AS hosts
+        FROM site_places
         GROUP BY domain
-        ORDER BY places DESC
+        ORDER BY domain  -- sorted, so loading it into the crawl database is fast
     """)
     con.execute(f"COPY domain_list TO '{domains}' (FORMAT CSV, HEADER)")
     n = con.execute("SELECT count(*) FROM domain_list").fetchone()[0]

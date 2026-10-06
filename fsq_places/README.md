@@ -18,6 +18,19 @@ python export_places.py --schema-only   # print the real columns and row count
 python export_places.py                 # output/places.csv + output/domains.csv
 ```
 
+## Main domains
+
+`domains.csv` and `companies.csv` use each company's **main domain**: store-locator and other
+subdomains are merged into it (`locations.pizzahut.com` and `www.pizzahut.com` -> `pizzahut.com`),
+which also removes duplicate companies. Website-builder sites keep their subdomain because the
+subdomain *is* the business (`joes.business.site`, `bakery.wixsite.com`, `cafe.squarespace.com`), and
+government sites stay at agency level (`dmv.ca.gov`). Rules: `domain_root.py` (Public Suffix List via
+tldextract, offline, plus a list of builder platforms). `--keep-subdomains` restores the old behaviour.
+`output/host_roots.csv` lists every website host and the main domain it was mapped to.
+
+The crawler visits `https://<main domain>/` and falls back to `www.<main domain>` when the bare
+domain doesn't resolve.
+
 ## Options
 
 | Flag | Effect |
@@ -26,6 +39,7 @@ python export_places.py                 # output/places.csv + output/domains.csv
 | `--open-only` | Drop places with `date_closed` set |
 | `--with-website` | Keep only places that have a website |
 | `--companies` | Write `companies.csv`: one row per unique website domain (all columns + `domain`, `domain_places`, `likely_directory`) |
+| `--keep-subdomains` | Use each website host as is instead of its main domain |
 | `--domains-only` | Rebuild only `domains.csv` (skips the big places export) |
 | `--format parquet` | Write `places.parquet` instead (same data, much smaller) |
 | `--release 2025-09-09` | Use a specific release instead of the latest |
@@ -66,7 +80,7 @@ you pass `--live-all`. If the file is open in Excel (which locks it), rows are k
 written once it's closed.
 
 ```bash
-python company_crawler.py init                 # load domains.csv into output/crawl.db (once)
+python company_crawler.py init --replace       # load domains.csv into a fresh output/crawl.db
 python company_crawler.py diagnose             # test your network, prints the best --dns/--concurrency
 python company_crawler.py crawl --limit 1000   # test run
 python company_crawler.py crawl                # full run (resumable)
