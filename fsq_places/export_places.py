@@ -101,11 +101,13 @@ def add_site_places(con, out_dir: Path, keep_subdomains: bool = False):
         return
     from domain_root import root_domain
 
-    print("Mapping website hosts to main domains (a few minutes)...", flush=True)
+    print("Mapping website hosts to main domains. Don't close the window; this takes 5-15 minutes.", flush=True)
+    print("  1/2 collecting the unique website hosts (1-3 minutes, no counter yet)...", flush=True)
     path = out_dir / "host_roots.csv"
     cur = con.execute(f"SELECT DISTINCT host FROM ({host_sql}) WHERE host LIKE '%_._%'")
+    print("  2/2 finding each host's main domain:", flush=True)
     n = changed = 0
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    with open(path, "w", newline="", encoding="utf-8", errors="replace") as f:
         w = csv.writer(f)
         w.writerow(["host", "root"])
         while batch := cur.fetchmany(200_000):
@@ -114,8 +116,8 @@ def add_site_places(con, out_dir: Path, keep_subdomains: bool = False):
                 changed += root != host
                 w.writerow([host, root])
             n += len(batch)
-            print(f"\r  {n:,} hosts", end="", flush=True)
-    print(f"\r  {n:,} hosts, {changed:,} were subdomains mapped to their main domain")
+            print(f"\r      {n:,} hosts done", end="", flush=True)
+    print(f"\r      {n:,} hosts done, {changed:,} were subdomains mapped to their main domain")
     con.execute(f"""CREATE TEMP TABLE host_roots AS SELECT * FROM read_csv('{path}', header=true, quote='"',
                     columns={{'host': 'VARCHAR', 'root': 'VARCHAR'}})""")
     con.execute(f"CREATE VIEW site_places AS SELECT p.*, r.root AS domain FROM ({host_sql}) p JOIN host_roots r USING (host)")
