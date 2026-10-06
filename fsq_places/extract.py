@@ -38,10 +38,18 @@ SOCIAL_BASE = {
 }
 
 
+SOCIAL_KEYWORDS = {"linkedin": ("linkedin.",), "facebook": ("facebook.", "fb.com"), "instagram": ("instagram.",),
+                   "twitter": ("twitter.", "x.com"), "youtube": ("youtube.",), "tiktok": ("tiktok.",),
+                   "pinterest": ("pinterest.",), "github": ("github.",), "whatsapp": ("wa.me", "whatsapp.")}
+
+
 def socials(text: str) -> dict:
     """Most frequent profile per platform (a site's own link usually appears in header and footer)."""
     found = {}
+    lower = text.lower()
     for platform, rx in SOCIAL_RE.items():
+        if not any(k in lower for k in SOCIAL_KEYWORDS[platform]):
+            continue  # cheap check before the regex
         skip = SOCIAL[platform][1]
         hits = []
         for m in rx.finditer(text):
@@ -255,8 +263,9 @@ def visible_text(html: str) -> str:
 
 def postal_address(html: str) -> str | None:
     """Best-effort postal address from microdata, <address>, map links or the page text."""
+    lower = html.lower()
     parts: dict = {}
-    for key, content, inner in MICRODATA_RE.findall(html):
+    for key, content, inner in (MICRODATA_RE.findall(html) if "itemprop" in lower else ()):
         val = (content or inner).strip()
         if val and key.lower() not in parts:
             parts[key.lower()] = val
@@ -264,11 +273,11 @@ def postal_address(html: str) -> str | None:
         order = ("streetaddress", "addresslocality", "addressregion", "postalcode", "addresscountry")
         if a := _clean_address(", ".join(parts[k] for k in order if k in parts)):
             return a
-    for block in ADDRESS_TAG_RE.findall(html):
+    for block in (ADDRESS_TAG_RE.findall(html) if "<address" in lower else ()):
         lines = [ln.strip() for ln in TAGS_RE.sub("\n", re.sub(r"<br\s*/?>", "\n", block, flags=re.I)).split("\n")]
         if a := _clean_address(", ".join(ln for ln in lines if ln and "@" not in ln and not ln.lower().startswith(("tel", "phone", "fax", "email")))):
             return a[:200]
-    for m in MAPS_RE.findall(html):
+    for m in (MAPS_RE.findall(html) if "maps" in lower else ()):
         if a := _clean_address(unquote(m.replace("+", " "))):
             return a
     text = visible_text(html)

@@ -41,7 +41,7 @@ from extract import extract, merge
 from tech_detect import Detector
 
 USER_AGENT = "Mozilla/5.0 (compatible; CompanyInfoBot/1.0; +https://daddy-leads.com/bot)"
-MAX_BYTES = 1_000_000
+MAX_BYTES = 600_000  # company info sits in the first/last part of a page; less text = less CPU
 
 # Platforms that are not a company's own website
 SKIP_HOSTS = (
@@ -269,6 +269,19 @@ def analyze_sub(html: str, url: str):
     return extract(html, url)
 
 
+# Pages waiting for (or in) CPU analysis. If this stays far above the number of workers,
+# the CPU, not the network, is what limits the speed.
+BACKLOG = {"pages": 0}
+
+
+async def analyze(loop, pool, fn, *fn_args):
+    BACKLOG["pages"] += 1
+    try:
+        return await loop.run_in_executor(pool, fn, *fn_args)
+    finally:
+        BACKLOG["pages"] -= 1
+
+
 # ---------------------------------------------------------------- fetching one site
 
 async def crawl_site(session, domain, args, pool) -> dict:
@@ -291,13 +304,15 @@ async def crawl_site(session, domain, args, pool) -> dict:
             if robots:
                 robots.cancel()
             last_error = f"{type(e).__name__}: {e}"[:200]
+            if classify_error(e) == "dns":
+                break  # the domain doesn't resolve; http:// would fail the same way
             continue
         if robots and not await robots:
             return {"status": "robots", "final_url": base}
         if html is None:
             last_error = f"HTTP {status_code}"
             continue
-        home, techs, cats = await loop.run_in_executor(pool, analyze_home, html, final_url, headers, cookies)
+        home, techs, cats = await analyze(loop, pool, analyze_home, html, final_url, headers, cookies)
 
         # contact and about pages are fetched at the same time
         sub_urls = [u for kind in ("contact", "about")[: max(args.max_pages - 1, 0)]
@@ -308,7 +323,7 @@ async def crawl_site(session, domain, args, pool) -> dict:
                 _, sub_url, sub_html, _, _ = await fetch(session, url)
             except Exception:
                 return None
-            return await loop.run_in_executor(pool, analyze_sub, sub_html, sub_url) if sub_html else None
+            return await analyze(loop, pool, analyze_sub, sub_html, sub_url) if sub_html else None
 
         pages = [home] + [p for p in await asyncio.gather(*(sub_page(u) for u in sub_urls)) if p]
         info = merge(pages, domain)
@@ -457,8 +472,11 @@ async def run_crawl(args, pool):
             done = sum(stats[s] for s in ("ok", "error", "skipped", "robots"))
             rate = done / max(time.time() - started, 1)
             eta = (target - done) / max(rate, 0.01) / 3600
+            backlog = BACKLOG["pages"]
+            cpu_note = "  <- CPU-bound: see README speed tips" if backlog > args.workers_used * 6 else ""
             print(f"  {done:,}/{target:,}  {rate:.0f}/s  ok={stats['ok']:,}  email={stats['with_email']:,}  "
-                  f"linkedin={stats['with_linkedin']:,}  error={stats['error']:,}  ETA {eta:.1f}h", flush=True)
+                  f"linkedin={stats['with_linkedin']:,}  error={stats['error']:,}  "
+                  f"cpu-queue={backlog}  ETA {eta:.1f}h{cpu_note}", flush=True)
 
     report = asyncio.create_task(reporter())
     flushing = asyncio.create_task(flusher())
@@ -576,7 +594,7 @@ def cmd_diagnose(args):
 
 
 def cmd_crawl(args):
-    workers = args.workers or max(1, (os.cpu_count() or 2) - 1)
+    workers = args.workers_used = args.workers or max(1, (os.cpu_count() or 2) - 1)
     tech_data = None if args.no_tech else args.tech_data
     if tech_data:
         Detector(Path(tech_data))  # download fingerprints once, before the workers start
