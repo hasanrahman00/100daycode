@@ -258,8 +258,11 @@ def _clean_address(text: str | None) -> str | None:
 def visible_text(html: str) -> str:
     if len(html) > 600_000:  # keep the header and the footer, where addresses usually are
         html = html[:300_000] + "\n" + html[-300_000:]
-    text = SCRIPT_STYLE_RE.sub(" ", html)
-    text = re.sub(r"<br\s*/?>|</(?:p|div|li|td|tr|h\d)>", "\n", text, flags=re.I)
+    text = re.sub(r"<head\b.*?</head>", " ", html, flags=re.I | re.S)  # title/meta aren't page text
+    text = SCRIPT_STYLE_RE.sub(" ", text)
+    # block-level tags start a new line, so separate page parts never run together
+    text = re.sub(r"<br\s*/?>|</?(?:p|div|li|ul|ol|td|th|tr|table|h\d|footer|header|section|article|nav|aside|"
+                  r"address|main|body|title)\b[^>]*>", "\n", text, flags=re.I)
     return htmllib.unescape(TAGS_RE.sub(" ", text))
 
 

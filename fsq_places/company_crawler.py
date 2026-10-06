@@ -351,12 +351,24 @@ async def crawl_site(session, domain, args, pool) -> dict:
     return {"status": "error", "http_status": status_code, "error": last_error}
 
 
-HEADERS = {"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8",
-           "Accept-Language": "en", "Accept-Encoding": "gzip, deflate"}
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/128.0.0.0 Safari/537.36")
 
 
-def make_session(concurrency: int, timeout: float, dns: str) -> aiohttp.ClientSession:
-    """dns: 'system' (Windows/router resolver) or 'public' / comma-separated server IPs."""
+def make_headers(user_agent: str = "bot") -> dict:
+    """'bot' announces the crawler honestly; 'browser' looks like Chrome (gets past simple bot filters)."""
+    if user_agent == "browser":
+        return {"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip, deflate",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Upgrade-Insecure-Requests": "1"}
+    return {"User-Agent": USER_AGENT if user_agent == "bot" else user_agent,
+            "Accept": "text/html,*/*;q=0.8", "Accept-Language": "en", "Accept-Encoding": "gzip, deflate"}
+
+
+def make_session(concurrency: int, timeout: float, dns: str, user_agent: str = "bot",
+                 proxy: str | None = None) -> aiohttp.ClientSession:
+    """dns: 'system' (Windows/router resolver) or 'public' / comma-separated server IPs.
+    proxy: e.g. http://user:pass@gate.provider.com:8000 (the proxy then also does the DNS lookups)."""
     resolver = None
     if dns != "system":
         from dns_resolver import PublicDNSResolver
@@ -366,7 +378,7 @@ def make_session(concurrency: int, timeout: float, dns: str) -> aiohttp.ClientSe
     connector = aiohttp.TCPConnector(limit=concurrency * 3, limit_per_host=3, ttl_dns_cache=300,
                                      ssl=False, resolver=resolver)
     return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, connect=min(timeout, 5)),
-                                 connector=connector, headers=HEADERS)
+                                 connector=connector, headers=make_headers(user_agent), proxy=proxy)
 
 
 # aiohttp logs "Can not load cookies: Illegal cookie name ..." for odd cookies some sites send. Harmless.
@@ -388,6 +400,8 @@ async def run_crawl(args, pool):
     if args.retry_errors:
         # only sites that had already failed when this run started, so it can run next to the main crawl
         where = f"status = 'error' AND CAST(crawled_at AS INTEGER) < {int(time.time())}"
+        if args.only_blocked:  # sites that answered but refused us: worth retrying with --user-agent/--proxy
+            where += " AND (error LIKE 'HTTP 403%' OR error LIKE 'HTTP 429%' OR error LIKE 'HTTP 503%')"
     else:
         where = "status IS NULL"
     params: list = []
@@ -406,7 +420,9 @@ async def run_crawl(args, pool):
     # DNS lookups run in threads; the default pool is too small for hundreds of connections
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max(64, args.concurrency)))
     quiet_connection_resets(asyncio.get_running_loop())
-    print(f"DNS: {'system resolver' if args.dns == 'system' else 'public DNS servers'}")
+    print(f"DNS: {'system resolver' if args.dns == 'system' else 'public DNS servers'}; "
+          f"user agent: {args.user_agent}; proxy: {'yes' if args.proxy else 'no'}")
+
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
     results: list = []
     stats: Counter = Counter()
@@ -514,7 +530,7 @@ async def run_crawl(args, pool):
     report = asyncio.create_task(reporter())
     flushing = asyncio.create_task(flusher())
     try:
-        async with make_session(args.concurrency, args.timeout, args.dns) as session:
+        async with make_session(args.concurrency, args.timeout, args.dns, args.user_agent, args.proxy) as session:
             await asyncio.gather(producer(), *(worker(session) for _ in range(args.concurrency)))
     finally:
         report.cancel()
@@ -627,6 +643,8 @@ def cmd_diagnose(args):
 
 
 def cmd_crawl(args):
+    if args.only_blocked and not args.retry_errors:
+        sys.exit("--only-blocked works together with --retry-errors")
     workers = args.workers_used = args.workers or max(1, (os.cpu_count() or 2) - 1)
     tech_data = None if args.no_tech else args.tech_data
     if tech_data:
@@ -696,6 +714,11 @@ def main():
     s.add_argument("--retry-errors", action="store_true",
                    help="Retry only sites that failed before this run started (safe next to the main crawl; "
                         "writes crawl_live_retry.csv)")
+    s.add_argument("--only-blocked", action="store_true",
+                   help="With --retry-errors: only retry sites that blocked us (HTTP 403/429/503)")
+    s.add_argument("--user-agent", default="bot",
+                   help="'bot' (default, honest crawler name), 'browser' (looks like Chrome) or a custom string")
+    s.add_argument("--proxy", help="Proxy URL, e.g. http://user:pass@gate.provider.com:8000")
     s.add_argument("--progress-every", type=float, default=15,
                    help="Seconds between progress updates (under 5 refreshes one line in place)")
     s.add_argument("--no-robots", action="store_true", help="Don't check robots.txt (faster, less polite)")

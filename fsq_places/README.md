@@ -85,6 +85,10 @@ python company_crawler.py join --companies path/to/companies.csv   # output/comp
 | `--retry-errors` | Also retry sites that failed before |
 | `--no-robots` | Skip the robots.txt check (faster, less polite) |
 | `--no-tech` | Skip technology detection (faster) |
+| `--user-agent browser` | Identify as a normal Chrome browser instead of `CompanyInfoBot` (gets past simple bot filters that answer 403) |
+| `--proxy URL` | Send all requests through a proxy, e.g. a rotating proxy gateway `http://user:pass@host:port` |
+| `--retry-errors --only-blocked` | Retry only sites that refused us (HTTP 403/429/503), e.g. with `--user-agent browser` or `--proxy` |
+| `--progress-every 1` | Progress every second (refreshes one line in place) |
 
 Statuses: `ok`, `robots` (site disallows crawling), `skipped` (social/booking platforms),
 `error` (dead or unreachable).
