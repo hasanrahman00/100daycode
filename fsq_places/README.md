@@ -89,6 +89,21 @@ python company_crawler.py join --companies path/to/companies.csv   # output/comp
 Statuses: `ok`, `robots` (site disallows crawling), `skipped` (social/booking platforms),
 `error` (dead or unreachable).
 
+### Speed tips
+
+- Run `python company_crawler.py diagnose` first; it tests your network and prints the best
+  `--dns` / `--concurrency` for it.
+- If the share of `ok` sites drops (more than ~50-55% errors), your connection is overloaded:
+  lower `--concurrency` and/or add `--dns public`. Around 35-45% errors is normal (dead websites).
+- If the progress line keeps saying *CPU-bound* (`cpu-queue` stays high), the CPU can't keep up
+  with page analysis: add `--no-tech` (skips technology detection, roughly halves CPU work),
+  `--max-pages 2`, or use a machine with more cores.
+- After the main crawl, retry failures once at a gentler pace:
+  `python company_crawler.py crawl --retry-errors --dns public --concurrency 100 --timeout 15`.
+  Don't run it at the same time as the main crawl (both would pick the same sites).
+- For a much faster crawl, run it on a cloud server (VPS) with a fast connection: datacenter
+  networks handle 500-1,000 parallel connections without dropping them.
+
 **Directory sites:** some businesses list a directory page as their website (e.g. `gelbeseiten.de`,
 244k German places). A domain with 20+ places where under 20% of place names contain the domain's brand gets
 `likely_directory = true` in `companies.csv`, and `join` leaves its `site_*` columns empty so the
