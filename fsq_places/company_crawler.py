@@ -16,6 +16,7 @@ Usage:
     python company_crawler.py crawl --limit 1000        # test run
     python company_crawler.py crawl                     # full run, resumable
     python company_crawler.py crawl --shard 0/4         # 4 windows: --shard 0/4 ... --shard 3/4
+    python company_crawler.py diagnose                  # test your network, get recommended settings
     python company_crawler.py stats                     # progress and what was found
     python company_crawler.py reset                     # clear all results and start fresh
     python company_crawler.py export                    # output/crawl_results.csv
@@ -321,6 +322,34 @@ async def crawl_site(session, domain, args, pool) -> dict:
     return {"status": "error", "http_status": status_code, "error": last_error}
 
 
+HEADERS = {"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8",
+           "Accept-Language": "en", "Accept-Encoding": "gzip, deflate"}
+
+
+def make_session(concurrency: int, timeout: float, dns: str) -> aiohttp.ClientSession:
+    """dns: 'system' (Windows/router resolver) or 'public' / comma-separated server IPs."""
+    resolver = None
+    if dns != "system":
+        from dns_resolver import PublicDNSResolver
+        servers = None if dns == "public" else [x.strip() for x in dns.split(",") if x.strip()]
+        resolver = PublicDNSResolver(servers, max_in_flight=max(50, concurrency))
+    # up to ~3 requests per site run at once (robots + homepage, then contact + about)
+    connector = aiohttp.TCPConnector(limit=concurrency * 3, limit_per_host=3, ttl_dns_cache=300,
+                                     ssl=False, resolver=resolver)
+    return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, connect=min(timeout, 5)),
+                                 connector=connector, headers=HEADERS)
+
+
+def quiet_connection_resets(loop):
+    """Windows prints a traceback whenever a server resets a connection while it closes
+    (_ProactorBasePipeTransport._call_connection_lost). It's harmless, so hide it."""
+    def handler(loop, context):
+        if isinstance(context.get("exception"), (ConnectionResetError, ConnectionAbortedError)):
+            return
+        loop.default_exception_handler(context)
+    loop.set_exception_handler(handler)
+
+
 async def run_crawl(args, pool):
     con = connect(args.db)
     where = "(status IS NULL OR status = 'error')" if args.retry_errors else "status IS NULL"
@@ -339,6 +368,8 @@ async def run_crawl(args, pool):
 
     # DNS lookups run in threads; the default pool is too small for hundreds of connections
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max(64, args.concurrency)))
+    quiet_connection_resets(asyncio.get_running_loop())
+    print(f"DNS: {'system resolver' if args.dns == 'system' else 'public DNS servers'}")
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
     results: list = []
     stats: Counter = Counter()
@@ -429,15 +460,10 @@ async def run_crawl(args, pool):
             print(f"  {done:,}/{target:,}  {rate:.0f}/s  ok={stats['ok']:,}  email={stats['with_email']:,}  "
                   f"linkedin={stats['with_linkedin']:,}  error={stats['error']:,}  ETA {eta:.1f}h", flush=True)
 
-    timeout = aiohttp.ClientTimeout(total=args.timeout, connect=min(args.timeout, 5))
-    # up to ~3 requests per site run at once (robots + homepage, then contact + about)
-    connector = aiohttp.TCPConnector(limit=args.concurrency * 3, limit_per_host=3, ttl_dns_cache=300, ssl=False)
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,*/*;q=0.8",
-               "Accept-Language": "en", "Accept-Encoding": "gzip, deflate"}
     report = asyncio.create_task(reporter())
     flushing = asyncio.create_task(flusher())
     try:
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
+        async with make_session(args.concurrency, args.timeout, args.dns) as session:
             await asyncio.gather(producer(), *(worker(session) for _ in range(args.concurrency)))
     finally:
         report.cancel()
@@ -446,6 +472,107 @@ async def run_crawl(args, pool):
         done = sum(stats[s] for s in ("ok", "error", "skipped", "robots"))
         print(f"\nThis run: {done:,} sites, {stats['ok']:,} ok, {stats['with_email']:,} with email, "
               f"{stats['with_linkedin']:,} with LinkedIn. Run 'stats' for totals.")
+
+
+# ---------------------------------------------------------------- network diagnosis
+
+def classify_error(e: BaseException) -> str:
+    text = f"{type(e).__name__}: {e}"
+    if isinstance(e, asyncio.TimeoutError) or "Timeout" in type(e).__name__:
+        return "timeout"
+    if "DNS" in text or "getaddrinfo" in text or "Name or service not known" in text \
+            or "nodename nor servname" in text or "11001" in text:
+        return "dns"
+    if "SSL" in text or "Certificate" in text or "certificate" in text:
+        return "ssl"
+    if isinstance(e, (ConnectionResetError, aiohttp.ServerDisconnectedError)) or "10054" in text:
+        return "reset"
+    if isinstance(e, aiohttp.ClientConnectorError):
+        return "refused"
+    return "other"
+
+
+async def probe(domains: list[str], concurrency: int, timeout: float, dns: str) -> dict:
+    """Fetch each homepage once (https, then http) and count outcomes."""
+    counts: Counter = Counter()
+    sem = asyncio.Semaphore(concurrency)
+    started = time.time()
+
+    async def one(session, domain):
+        async with sem:
+            outcome = "other"
+            for scheme in ("https", "http"):
+                try:
+                    async with session.get(f"{scheme}://{domain}/", allow_redirects=True, max_redirects=5) as r:
+                        await r.content.read(50_000)
+                        outcome = "ok" if r.status < 400 else f"http {r.status // 100}xx"
+                        break
+                except Exception as e:  # noqa: BLE001 - every failure is a data point here
+                    outcome = classify_error(e)
+                    if outcome == "timeout":
+                        break
+            counts[outcome] += 1
+
+    async with make_session(concurrency, timeout, dns) as session:
+        await asyncio.gather(*(one(session, d) for d in domains))
+    counts["_seconds"] = time.time() - started
+    return counts
+
+
+def cmd_diagnose(args):
+    """Try a few hundred real domains with different settings and recommend the best ones."""
+    import random
+
+    con = connect(args.db)
+    max_rowid = con.execute("SELECT max(rowid) FROM sites").fetchone()[0] or 0
+    if not max_rowid:
+        sys.exit("No domains loaded. Run init first.")
+    configs = [("system", 50), ("system", 300), ("public", 50), ("public", 300), ("public", 800)]
+    rng = random.Random(42)
+    rowids = rng.sample(range(1, max_rowid + 1), min(max_rowid, args.sample * len(configs) * 2))
+    pool = []
+    for i in range(0, len(rowids), 900):
+        chunk = rowids[i:i + 900]
+        pool += [d for (d,) in con.execute(
+            f"SELECT domain FROM sites WHERE rowid IN ({','.join('?' * len(chunk))})", chunk)
+            if not is_skipped(d)]
+    rng.shuffle(pool)
+    known = ["google.com", "microsoft.com", "wikipedia.org", "amazon.com", "apple.com",
+             "cloudflare.com", "github.com", "bbc.co.uk", "shopify.com", "wordpress.org"]
+
+    async def run_all():
+        quiet_connection_resets(asyncio.get_running_loop())
+        print("Checking basic internet access with 10 well-known sites...")
+        base = await probe(known, 10, args.timeout, "system")
+        print(f"  {base['ok']}/10 reachable" + ("" if base["ok"] >= 8 else
+              "  <- your internet connection itself has problems (proxy, firewall or antivirus?)"))
+        print(f"\nTesting {args.sample} random domains from your list per setting "
+              "(takes a few minutes; nothing is saved):")
+        print(f"  {'DNS':<8}{'at once':>8}{'ok':>7}{'dns':>7}{'timeout':>9}{'refused':>9}{'reset':>7}"
+              f"{'ssl':>6}{'http4/5':>9}{'other':>7}{'sites/s':>9}")
+        results = []
+        for n, (dns, conc) in enumerate(configs):
+            sample = pool[n * args.sample:(n + 1) * args.sample]
+            c = await probe(sample, conc, args.timeout, dns)
+            total = len(sample)
+            pct = {k: c[k] / total for k in ("ok", "dns", "timeout", "refused", "reset", "ssl", "other")}
+            pct["http"] = (c["http 4xx"] + c["http 5xx"]) / total
+            speed = total / max(c["_seconds"], 0.1)
+            results.append((dns, conc, pct["ok"], speed))
+            print(f"  {dns:<8}{conc:>8}{pct['ok']:>7.0%}{pct['dns']:>7.0%}{pct['timeout']:>9.0%}"
+                  f"{pct['refused']:>9.0%}{pct['reset']:>7.0%}{pct['ssl']:>6.0%}{pct['http']:>9.0%}"
+                  f"{pct['other']:>7.0%}{speed:>9.1f}", flush=True)
+        best_ok = max(r[2] for r in results)
+        good = [r for r in results if r[2] >= best_ok - 0.03]  # nearly as accurate as the best
+        dns, conc, ok, _ = max(good, key=lambda r: (r[1], r[3]))
+        print(f"\nBest setting: --dns {dns} --concurrency {conc}  ({ok:.0%} of sites reachable)")
+        print(f"Run:  python company_crawler.py crawl --dns {dns} --concurrency {conc} --timeout {args.timeout:g}")
+        if best_ok < 0.45:
+            print("Note: under 45% of random domains load with every setting. Many listed websites are "
+                  "dead, but if 'timeout' or 'reset' is high your network/router is the limit; a cloud "
+                  "server (VPS) would be much faster.")
+
+    asyncio.run(run_all())
 
 
 def cmd_crawl(args):
@@ -518,12 +645,19 @@ def main():
     s.add_argument("--retry-errors", action="store_true", help="Also retry sites that failed before")
     s.add_argument("--no-robots", action="store_true", help="Don't check robots.txt (faster, less polite)")
     s.add_argument("--no-tech", action="store_true", help="Skip technology detection (faster)")
+    s.add_argument("--dns", default="system",
+                   help="'system' (default), 'public' (Cloudflare/Google/Quad9) or comma-separated DNS server IPs")
     s.add_argument("--live", help="Live CSV to append results to (default: output/crawl_live.csv)")
     s.add_argument("--live-all", action="store_true", help="Also write failed/skipped sites to the live CSV")
     s.add_argument("--tech-data", default="data/webappanalyzer", help="Where Wappalyzer fingerprints are cached")
     s.set_defaults(func=cmd_crawl)
 
     sub.add_parser("stats", help="Show progress and field coverage").set_defaults(func=cmd_stats)
+
+    s = sub.add_parser("diagnose", help="Test your network with different settings and recommend the best")
+    s.add_argument("--sample", type=int, default=300, help="Domains tested per setting")
+    s.add_argument("--timeout", type=float, default=8)
+    s.set_defaults(func=cmd_diagnose)
 
     s = sub.add_parser("reset", help="Clear all crawl results and start fresh (no new init needed)")
     s.add_argument("--yes", action="store_true", help="Don't ask for confirmation")

@@ -67,6 +67,7 @@ written once it's closed.
 
 ```bash
 python company_crawler.py init                 # load domains.csv into output/crawl.db (once)
+python company_crawler.py diagnose             # test your network, prints the best --dns/--concurrency
 python company_crawler.py crawl --limit 1000   # test run
 python company_crawler.py crawl                # full run (resumable)
 python company_crawler.py stats                # progress, field coverage, error reasons, speed and ETA
@@ -76,7 +77,8 @@ python company_crawler.py join --companies path/to/companies.csv   # output/comp
 
 | Crawl flag | Effect |
 |---|---|
-| `--concurrency 200` | Sites fetched at the same time per window |
+| `--concurrency 500` | Sites fetched at the same time |
+| `--dns public` | Look up domains via Cloudflare/Google/Quad9 instead of your router (often fixes mass DNS/timeout errors) |
 | `--shard 0/4` | Split the work over several windows/cores: run `0/4`, `1/4`, `2/4`, `3/4` |
 | `--max-pages 3` | Pages per site: homepage + contact + about |
 | `--country US GB` | Only crawl domains from these countries |
