@@ -17,6 +17,7 @@ Usage:
     python company_crawler.py crawl                     # full run, resumable
     python company_crawler.py crawl --shard 0/4         # 4 windows: --shard 0/4 ... --shard 3/4
     python company_crawler.py stats                     # progress and what was found
+    python company_crawler.py reset                     # clear all results and start fresh
     python company_crawler.py export                    # output/crawl_results.csv
     python company_crawler.py join --companies C:/Users/Administrator/Documents/companies.csv
 """
@@ -136,6 +137,30 @@ def cmd_init(args):
         con.commit()
         total += len(batch)
     print(f"\rLoaded {total:,} domains into {args.db} in {time.time() - t:.0f}s")
+
+
+def cmd_reset(args):
+    """Start over: clear every crawl result (keeps the loaded domains, so no new init needed)."""
+    con = connect(args.db)
+    done = con.execute("SELECT count(*) FROM sites WHERE status IS NOT NULL").fetchone()[0]
+    if not args.yes:
+        answer = input(f"Clear the results of {done:,} crawled sites and start fresh? Type yes: ")
+        if answer.strip().lower() != "yes":
+            print("Nothing changed.")
+            return
+    con.execute(f"UPDATE sites SET {', '.join(f'{c} = NULL' for c in RESULT_COLS)} WHERE status IS NOT NULL")
+    con.commit()
+    old_dir = args.out_dir / "old_runs"
+    moved = 0
+    for f in args.out_dir.glob("crawl_live*.csv"):
+        old_dir.mkdir(exist_ok=True)
+        try:
+            f.rename(old_dir / f"{f.stem}_{time.strftime('%Y%m%d_%H%M%S')}{f.suffix}")
+            moved += 1
+        except OSError:
+            print(f"  ! Couldn't move {f.name} (open in Excel?). Close it and move or delete it yourself.")
+    print(f"Cleared {done:,} results; all sites are pending again."
+          + (f" Moved {moved} old live file(s) to {old_dir}." if moved else ""))
 
 
 def cmd_stats(args):
@@ -499,6 +524,10 @@ def main():
     s.set_defaults(func=cmd_crawl)
 
     sub.add_parser("stats", help="Show progress and field coverage").set_defaults(func=cmd_stats)
+
+    s = sub.add_parser("reset", help="Clear all crawl results and start fresh (no new init needed)")
+    s.add_argument("--yes", action="store_true", help="Don't ask for confirmation")
+    s.set_defaults(func=cmd_reset)
     sub.add_parser("export", help="Write output/crawl_results.csv").set_defaults(func=cmd_export)
 
     s = sub.add_parser("join", help="Write output/companies_enriched.csv")

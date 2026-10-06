@@ -69,7 +69,8 @@ written once it's closed.
 python company_crawler.py init                 # load domains.csv into output/crawl.db (once)
 python company_crawler.py crawl --limit 1000   # test run
 python company_crawler.py crawl                # full run (resumable)
-python company_crawler.py stats                # progress, field coverage, speed and ETA
+python company_crawler.py stats                # progress, field coverage, error reasons, speed and ETA
+python company_crawler.py reset                # clear all results and start fresh (keeps loaded domains)
 python company_crawler.py join --companies path/to/companies.csv   # output/companies_enriched.csv
 ```
 
