@@ -25,6 +25,7 @@ Usage:
 import argparse
 import asyncio
 import csv
+import logging
 import os
 import sqlite3
 import sys
@@ -353,6 +354,10 @@ def make_session(concurrency: int, timeout: float, dns: str) -> aiohttp.ClientSe
                                      ssl=False, resolver=resolver)
     return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout, connect=min(timeout, 5)),
                                  connector=connector, headers=HEADERS)
+
+
+# aiohttp logs "Can not load cookies: Illegal cookie name ..." for odd cookies some sites send. Harmless.
+logging.getLogger("aiohttp.client").setLevel(logging.ERROR)
 
 
 def quiet_connection_resets(loop):

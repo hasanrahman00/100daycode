@@ -244,7 +244,9 @@ TEXT_ADDRESS_ANCHORS = [  # one per pattern above, same order
 def _clean_address(text: str | None) -> str | None:
     if not text:
         return None
-    a = re.sub(r"\s+", " ", htmllib.unescape(text)).strip(" ,;|-")
+    a = re.sub(r"\s*\n\s*", ", ", htmllib.unescape(text).strip())  # line breaks separate address parts
+    a = re.sub(r"\s+", " ", a).strip(" ,;|-")
+    a = re.sub(r"(,\s*)+", ", ", a)
     a = re.sub(r"\s*,\s*", ", ", a)
     if not (8 <= len(a) <= 200) or not re.search(r"\d", a) or not re.search(r"[A-Za-zÀ-ÿ]{2}", a):
         return None
@@ -289,6 +291,64 @@ def postal_address(html: str) -> str | None:
             window = text[max(0, am.start() - 220): am.end() + 80]
             if (m := rx.search(window)) and (a := _clean_address(m.group(0))):
                 return a
+    return address_near_postcode(text)
+
+
+# Postcode + city patterns for many countries; the street is then found on the lines just before.
+POSTCODE_RES = [
+    re.compile(r"\b[A-Z]{2}\s+\d{5}(?:-\d{4})?\b"),                                      # US: IL 62701
+    re.compile(r"\b(?:AB|BC|MB|NB|NL|NS|NT|NU|ON|PE|QC|SK|YT),?\s+[A-Z]\d[A-Z]\s?\d[A-Z]\d\b"),  # Canada: ON M5V 2T6
+    re.compile(r"\b[A-Z]\d[A-Z]\s?\d[A-Z]\d\b"),                                          # Canada, no province
+    re.compile(r"\b[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}\b"),                                  # UK: SW1A 2AA
+    re.compile(r"\b(?:NSW|VIC|QLD|WA|SA|TAS|ACT|NT)\s+\d{4}\b"),                            # Australia: NSW 2000
+    re.compile(r"\b\d{4}\s?[A-Z]{2}\s+[A-Z][A-Za-z'\- ]{2,30}"),                            # Netherlands: 1012 AB Amsterdam
+    re.compile(r"\b(?:C\.?\s?P\.?\s*)?\d{5}\s+[A-ZÀ-Ý][\w'’.\-]+(?: [A-ZÀ-Ýa-zà-ÿ][\w'’.\-]+){0,3}"),  # FR/DE/ES/IT/MX: 75008 Paris
+    re.compile(r"\b(?!19\d\d|20\d\d)\d{4}\s+[A-ZÀ-Ý][a-zà-ÿ][\w'’.\-]*(?: [A-ZÀ-Ýa-zà-ÿ][\w'’.\-]+){0,2}"),  # AT/CH/BE/DK/NO: 1010 Wien
+]
+STREET_WORD_RE = re.compile(
+    r"\b(?:street|st|road|rd|avenue|ave|av|boulevard|blvd|bd|drive|dr|lane|ln|way|court|ct|place|pl|square|"
+    r"parkway|pkwy|highway|hwy|suite|ste|floor|unit|level|building|rue|chemin|allée|allee|route|quai|impasse|"
+    r"calle|c/|avenida|avda|paseo|plaza|carrer|camino|carretera|colonia|col|via|viale|piazza|corso|largo|"
+    r"vicolo|rua|travessa|ulica|ul|aleja)\b\.?"
+    r"|(?:straße|strasse|str\.|weg|platz|gasse|allee|ring|damm|straat|laan|plein|gracht|kade|vej|gade|"
+    r"gatan|vägen|veien)\b", re.I)
+NOT_ADDRESS_RE = re.compile(r"\b(?:tel|phone|call|fax|mobile|whatsapp|email|e-mail|copyright|price|prices|order|"
+                            r"items?|qty|shipping|cart|sale|off|reviews?|rated)\b"
+                            r"|©|\d{7,}|\d+[.,]\d{2}\b|[$€£¥]|@|https?://|%", re.I)
+LINE_SPLIT_RE = re.compile(r"\s*(?:\n|\||•|·|\u2013|\u2014)\s*")
+
+
+def _looks_like_street(segment: str) -> bool:
+    if not (4 <= len(segment) <= 90) or NOT_ADDRESS_RE.search(segment) or re.search(r"\b0x[0-9a-f]+", segment, re.I):
+        return False
+    if not re.search(r"[A-Za-zÀ-ÿ]{3}", segment) and not STREET_WORD_RE.search(segment):  # a word, not just codes
+        return False
+    has_number = bool(re.search(r"\d", segment))
+    return has_number and (bool(STREET_WORD_RE.search(segment)) or bool(re.match(r"\d", segment))
+                           or bool(re.search(r"\d+[a-zA-Z]?$", segment)))
+
+
+def address_near_postcode(text: str) -> str | None:
+    """Find a postcode, then walk back up to 3 lines to the street line, and return the lines from
+    the street to the postcode/city as one address (handles addresses split over several lines)."""
+    for rx in POSTCODE_RES:
+        for n, m in enumerate(rx.finditer(text)):
+            if n == 30:
+                break
+            before = text[max(0, m.start() - 220): m.start()]
+            segments = [x.strip(" ,;") for x in LINE_SPLIT_RE.split(before)]
+            # the postcode's own line may also start with the street: "Via Roma 1, 00184 Roma"
+            tail = [x.strip() for x in segments[-1].split(",")] if segments else []
+            candidates = [x for x in segments[:-1] if x][-3:] + [x for x in tail if x]
+            for i in range(len(candidates) - 1, -1, -1):
+                seg = candidates[i].split(":")[-1].strip()  # drop labels like "Address:"
+                if _looks_like_street(seg):
+                    parts = [seg] + candidates[i + 1:] + [m.group(0).strip()]
+                    if any(NOT_ADDRESS_RE.search(p) for p in parts[1:-1]):
+                        break
+                    if a := _clean_address(", ".join(p for p in parts if p)):
+                        return a
+                    break
     return None
 
 
