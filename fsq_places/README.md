@@ -89,7 +89,7 @@ python company_crawler.py join --companies path/to/companies.csv   # output/comp
 | `--proxy URL` | Send all requests through a proxy, e.g. a rotating proxy gateway `http://user:pass@host:port` |
 | `--proxy-file FILE` | Proxy list, one per line (`ip:port:user:pass` as Webshare downloads it, `user:pass@ip:port`, or a URL); each site uses a random proxy, failing proxies are swapped and rested |
 | `--retry-errors --only-blocked` | Retry only sites that refused us (HTTP 403/429/503), e.g. with `--user-agent browser` or `--proxy` |
-| `--progress-every 1` | Progress every second (refreshes one line in place) |
+| `--progress-every 1` | Live dashboard redrawn every second in the same window: progress, speed now/average, ETA, ok/error split, how often each field was found, top error reasons, CPU queue |
 
 Statuses: `ok`, `robots` (site disallows crawling), `skipped` (social/booking platforms),
 `error` (dead or unreachable).

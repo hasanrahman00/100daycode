@@ -355,6 +355,58 @@ def analyze_sub(html: str, url: str):
     return extract(html, url)
 
 
+# ---------------------------------------------------------------- live dashboard
+
+DASH_FIELDS = ["emails", "phones", "org_address", "org_name", "linkedin", "facebook", "instagram",
+               "twitter", "youtube", "tech", "contact_url"]
+DASH_LABELS = {"org_address": "address", "org_name": "company name", "contact_url": "contact page"}
+
+
+def error_kind(error: str | None) -> str:
+    if not error:
+        return "unknown"
+    kind = error if error.startswith("HTTP ") else error.split(":")[0]
+    return {"ClientConnectorDNSError": "dead domain (DNS)", "ClientConnectorError": "refused",
+            "TimeoutError": "Timeout", "ServerDisconnectedError": "disconnected"}.get(kind, kind)
+
+
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    d, rest = divmod(seconds, 86400)
+    h, rest = divmod(rest, 3600)
+    m, s = divmod(rest, 60)
+    return (f"{d}d " if d else "") + f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def dashboard_lines(stats, err_kinds, done, target, started, history, backlog, workers) -> list[str]:
+    now = time.time()
+    avg = done / max(now - started, 1)
+    recent = ((history[-1][1] - history[0][1]) / (history[-1][0] - history[0][0])
+              if len(history) > 1 and history[-1][0] > history[0][0] else avg)
+    eta = (target - done) / max(recent, 0.01)
+    ok = stats["ok"]
+
+    def pct(n, of):
+        return f"{n:,} ({n / of:.0%})" if of else f"{n:,}"
+
+    found = [f"{DASH_LABELS.get(f, f)} {pct(stats['f_' + f], ok)}" for f in DASH_FIELDS]
+    n_err = sum(err_kinds.values())
+    top_errors = " | ".join(f"{k} {pct(n, n_err)}" for k, n in err_kinds.most_common(4)) or "-"
+    cpu = f"{backlog} pages waiting ({workers} workers)" + ("  <- CPU-bound" if backlog > workers * 6 else "")
+    return [
+        f" Live crawl  {time.strftime('%Y-%m-%d %H:%M:%S')}   running {_fmt_duration(now - started)}",
+        f" Progress    {done:,} / {target:,}  ({done / target:.2%})" if target else " Progress    -",
+        f" Speed       {recent:.1f} sites/s now, {avg:.1f} average   ETA {_fmt_duration(eta)}",
+        f" Results     ok {pct(ok, done)}   error {pct(stats['error'], done)}   "
+        f"robots {stats['robots']:,}   skipped {stats['skipped']:,}",
+        "   " + "   ".join(found[:4]),
+        "   " + "   ".join(found[4:9]),
+        "   " + "   ".join(found[9:]),
+        f" Errors      {top_errors}",
+        f" CPU         {cpu}",
+    ]
+
+
 # Pages waiting for (or in) CPU analysis. If this stays far above the number of workers,
 # the CPU, not the network, is what limits the speed.
 BACKLOG = {"pages": 0}
@@ -500,6 +552,7 @@ async def run_crawl(args, pool):
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
     results: list = []
     stats: Counter = Counter()
+    err_kinds: Counter = Counter()
     started = time.time()
     update_sql = f"UPDATE sites SET {', '.join(f'{c}=?' for c in RESULT_COLS)} WHERE domain=?"
 
@@ -569,6 +622,11 @@ async def run_crawl(args, pool):
             stats[r["status"]] += 1
             stats["with_email"] += bool(r.get("emails"))
             stats["with_linkedin"] += bool(r.get("linkedin"))
+            if r["status"] == "ok":
+                for f in DASH_FIELDS:
+                    stats["f_" + f] += bool(r.get(f))
+            elif r["status"] == "error":
+                err_kinds[error_kind(r.get("error"))] += 1
             # [domain, country, places] + result columns + [domain] (last one for the SQL WHERE)
             results.append([domain, country, places] + [r.get(c) for c in RESULT_COLS] + [domain])
             if len(results) >= 500:
@@ -579,14 +637,25 @@ async def run_crawl(args, pool):
             await asyncio.sleep(5)
             flush()
 
-    inline = args.progress_every < 5  # refresh one line in place instead of printing a new line each time
-    last_len = 0
+    dashboard = args.progress_every < 5  # redraw a live stats block in place instead of printing lines
+    drawn = 0
+    history: list = []  # (time, done) for the speed over the last minute
 
     async def reporter():
-        nonlocal last_len
+        nonlocal drawn
         while True:
             await asyncio.sleep(args.progress_every)
             done = sum(stats[s] for s in ("ok", "error", "skipped", "robots"))
+            if dashboard:
+                now = time.time()
+                history.append((now, done))
+                while history and history[0][0] < now - 60:
+                    history.pop(0)
+                lines = dashboard_lines(stats, err_kinds, done, target, started, history,
+                                        BACKLOG["pages"], args.workers_used)
+                print((f"\x1b[{drawn}F" if drawn else "") + "\n".join(l + "\x1b[K" for l in lines), flush=True)
+                drawn = len(lines)
+                continue
             rate = done / max(time.time() - started, 1)
             eta = (target - done) / max(rate, 0.01) / 3600
             backlog = BACKLOG["pages"]
@@ -595,11 +664,7 @@ async def run_crawl(args, pool):
             line = (f"  {done:,}/{target:,}  {rate:.0f}/s  ok={stats['ok']:,} ({ok_pct:.0%})  "
                     f"email={stats['with_email']:,}  linkedin={stats['with_linkedin']:,}  "
                     f"error={stats['error']:,}  cpu-queue={backlog}  ETA {eta:.1f}h{cpu_note}")
-            if inline:
-                print("\r" + line.ljust(last_len), end="", flush=True)
-                last_len = len(line)
-            else:
-                print(line, flush=True)
+            print(line, flush=True)
 
     report = asyncio.create_task(reporter())
     flushing = asyncio.create_task(flusher())
@@ -728,6 +793,8 @@ def cmd_crawl(args):
         PROXIES = ProxyPool(proxies)
         print(f"Loaded {len(proxies):,} proxies from {args.proxy_file}")
     workers = args.workers_used = args.workers or max(1, (os.cpu_count() or 2) - 1)
+    if sys.platform == "win32":
+        os.system("")  # turns on ANSI escape codes in the Windows console, used by the live dashboard
     tech_data = None if args.no_tech else args.tech_data
     if tech_data:
         Detector(Path(tech_data))  # download fingerprints once, before the workers start
@@ -804,7 +871,7 @@ def main():
     s.add_argument("--proxy-file", help="Text file with one proxy per line (ip:port:user:pass, e.g. a "
                                         "Webshare list); each site uses a random one")
     s.add_argument("--progress-every", type=float, default=15,
-                   help="Seconds between progress updates (under 5 refreshes one line in place)")
+                   help="Seconds between progress updates; under 5 shows a live dashboard redrawn in place")
     s.add_argument("--no-robots", action="store_true", help="Don't check robots.txt (faster, less polite)")
     s.add_argument("--no-tech", action="store_true", help="Skip technology detection (faster)")
     s.add_argument("--dns", default="system",
