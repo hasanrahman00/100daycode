@@ -166,41 +166,54 @@ def cmd_reset(args):
 
 
 def cmd_stats(args):
+    """Two passes over the table (17M rows): status + field coverage, then errors + recent speed."""
     con = connect(args.db)
-    rows = con.execute("SELECT coalesce(status, 'pending'), count(*) FROM sites GROUP BY 1 ORDER BY 2 DESC").fetchall()
-    total = sum(n for _, n in rows)
-    for s, n in rows:
-        print(f"  {s:<10} {n:>12,}")
-    print(f"  {'total':<10} {total:>12,}")
-    ok = dict(rows).get("ok", 0)
-    if not ok:
-        return
-    print(f"\nOf {ok:,} sites crawled successfully, how many had each field:")
-    for col in ["emails", "phones", "org_address", *SOCIAL_COLS, "org_name", "founding_date", "employees",
-                "tech", "contact_url"]:
-        n = con.execute(f"SELECT count(*) FROM sites WHERE status='ok' AND {col} IS NOT NULL AND {col} <> ''").fetchone()[0]
-        print(f"  {col:<14} {n:>12,}  {n / ok:6.1%}")
-
-    errors = con.execute("""
-        SELECT CASE WHEN error LIKE 'HTTP %' THEN error
-                    ELSE substr(error, 1, instr(coalesce(error, '?') || ':', ':') - 1) END AS kind, count(*)
-        FROM sites WHERE status = 'error' GROUP BY 1 ORDER BY 2 DESC LIMIT 12
+    fields = ["emails", "phones", "org_address", *SOCIAL_COLS, "org_name", "tech", "contact_url"]
+    print("Counting (reads the whole crawl database, ~1-2 minutes on 17M sites)...", flush=True)
+    sums = ", ".join(f"sum({c} <> '')" for c in fields)
+    rows = con.execute(f"""
+        SELECT coalesce(status, 'pending') AS st, count(*), max(CAST(crawled_at AS INTEGER)), {sums}
+        FROM sites GROUP BY st ORDER BY 2 DESC
     """).fetchall()
+    total = sum(r[1] for r in rows)
+    for r in rows:
+        print(f"  {r[0]:<10} {r[1]:>12,}")
+    print(f"  {'total':<10} {total:>12,}", flush=True)
+    by_status = {r[0]: r for r in rows}
+    last = max((r[2] for r in rows if r[2]), default=None)
+    if "ok" in by_status:
+        ok_row = by_status["ok"]
+        ok = ok_row[1]
+        print(f"\nOf {ok:,} sites crawled successfully, how many had each field:")
+        for col, n in zip(fields, ok_row[3:]):
+            n = n or 0
+            print(f"  {col:<14} {n:>12,}  {n / ok:6.1%}")
+    if last is None:
+        return
+
+    print("\nCounting errors...", flush=True)
+    kinds = con.execute("""
+        SELECT CASE WHEN status <> 'error' THEN '' WHEN error LIKE 'HTTP %' THEN error
+                    ELSE substr(error, 1, instr(coalesce(error, '?') || ':', ':') - 1) END AS kind,
+               count(*), sum(CAST(crawled_at AS INTEGER) >= ?), min(CASE WHEN CAST(crawled_at AS INTEGER) >= ?
+                                                                         THEN CAST(crawled_at AS INTEGER) END)
+        FROM sites WHERE status IS NOT NULL GROUP BY kind ORDER BY 2 DESC
+    """, (last - 600, last - 600)).fetchall()
+    errors = [(k, n) for k, n, _, _ in kinds if k != ""][:12]
     if errors:
-        n_err = sum(n for _, n in errors)
-        print("\nWhy sites failed:")
+        n_err = sum(n for k, n, _, _ in kinds if k != "")
+        print("Why sites failed:")
         for kind, n in errors:
             print(f"  {kind or 'unknown':<34} {n:>10,}  {n / n_err:6.1%}  {ERROR_HINTS.get(kind, '')}")
 
     # Speed over the last 10 minutes of activity, so pauses between runs don't skew it
-    last = con.execute("SELECT max(CAST(crawled_at AS INTEGER)) FROM sites WHERE crawled_at IS NOT NULL").fetchone()[0]
-    pending = dict(rows).get("pending", 0)
-    if last:
-        n, first = con.execute("SELECT count(*), min(CAST(crawled_at AS INTEGER)) FROM sites "
-                               "WHERE CAST(crawled_at AS INTEGER) >= ?", (last - 600,)).fetchone()
-        if last - first >= 30:
-            per_sec = n / (last - first)
-            print(f"\nRecent speed {per_sec:.1f} sites/s  ->  {pending:,} pending ≈ {pending / per_sec / 3600:.1f} h")
+    recent = sum(r[2] or 0 for r in kinds)
+    first = min((r[3] for r in kinds if r[3]), default=last)
+    pending = by_status.get("pending", (None, 0))[1]
+    if last - first >= 30:
+        per_sec = recent / (last - first)
+        print(f"\nRecent speed {per_sec:.1f} sites/s  ->  {pending:,} pending ≈ {pending / per_sec / 3600:.1f} h"
+              f"  (last result {as_date(last)})")
 
 
 ERROR_HINTS = {
