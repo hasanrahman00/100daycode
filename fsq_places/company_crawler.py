@@ -372,7 +372,11 @@ def quiet_connection_resets(loop):
 
 async def run_crawl(args, pool):
     con = connect(args.db)
-    where = "(status IS NULL OR status = 'error')" if args.retry_errors else "status IS NULL"
+    if args.retry_errors:
+        # only sites that had already failed when this run started, so it can run next to the main crawl
+        where = f"status = 'error' AND CAST(crawled_at AS INTEGER) < {int(time.time())}"
+    else:
+        where = "status IS NULL"
     params: list = []
     if args.country:
         where += f" AND country IN ({','.join('?' * len(args.country))})"
@@ -398,7 +402,8 @@ async def run_crawl(args, pool):
 
     # Live CSV on disk, appended every few seconds; one file per shard so windows don't collide
     live_path = start_live_file(Path(args.live) if args.live else args.out_dir / (
-        "crawl_live.csv" if shards == 1 else f"crawl_live_shard{shard}of{shards}.csv"))
+        ("crawl_live_retry" if args.retry_errors else "crawl_live")
+        + (".csv" if shards == 1 else f"_shard{shard}of{shards}.csv")))
     live_pending: list = []
     live_warned = False
     print(f"Live results file: {live_path.resolve()}")
@@ -471,17 +476,27 @@ async def run_crawl(args, pool):
             await asyncio.sleep(5)
             flush()
 
+    inline = args.progress_every < 5  # refresh one line in place instead of printing a new line each time
+    last_len = 0
+
     async def reporter():
+        nonlocal last_len
         while True:
-            await asyncio.sleep(15)
+            await asyncio.sleep(args.progress_every)
             done = sum(stats[s] for s in ("ok", "error", "skipped", "robots"))
             rate = done / max(time.time() - started, 1)
             eta = (target - done) / max(rate, 0.01) / 3600
             backlog = BACKLOG["pages"]
             cpu_note = "  <- CPU-bound: see README speed tips" if backlog > args.workers_used * 6 else ""
-            print(f"  {done:,}/{target:,}  {rate:.0f}/s  ok={stats['ok']:,}  email={stats['with_email']:,}  "
-                  f"linkedin={stats['with_linkedin']:,}  error={stats['error']:,}  "
-                  f"cpu-queue={backlog}  ETA {eta:.1f}h{cpu_note}", flush=True)
+            ok_pct = stats["ok"] / done if done else 0
+            line = (f"  {done:,}/{target:,}  {rate:.0f}/s  ok={stats['ok']:,} ({ok_pct:.0%})  "
+                    f"email={stats['with_email']:,}  linkedin={stats['with_linkedin']:,}  "
+                    f"error={stats['error']:,}  cpu-queue={backlog}  ETA {eta:.1f}h{cpu_note}")
+            if inline:
+                print("\r" + line.ljust(last_len), end="", flush=True)
+                last_len = len(line)
+            else:
+                print(line, flush=True)
 
     report = asyncio.create_task(reporter())
     flushing = asyncio.create_task(flusher())
@@ -665,7 +680,11 @@ def main():
     s.add_argument("--limit", type=int, help="Stop after this many sites (for test runs)")
     s.add_argument("--country", nargs="*", help="Only sites from these countries, e.g. US GB")
     s.add_argument("--shard", default="0/1", help="Split work across windows: 0/4, 1/4, 2/4, 3/4")
-    s.add_argument("--retry-errors", action="store_true", help="Also retry sites that failed before")
+    s.add_argument("--retry-errors", action="store_true",
+                   help="Retry only sites that failed before this run started (safe next to the main crawl; "
+                        "writes crawl_live_retry.csv)")
+    s.add_argument("--progress-every", type=float, default=15,
+                   help="Seconds between progress updates (under 5 refreshes one line in place)")
     s.add_argument("--no-robots", action="store_true", help="Don't check robots.txt (faster, less polite)")
     s.add_argument("--no-tech", action="store_true", help="Skip technology detection (faster)")
     s.add_argument("--dns", default="system",
