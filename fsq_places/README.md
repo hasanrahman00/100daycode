@@ -56,7 +56,10 @@ and collects:
   `data/webappanalyzer/`). Rules that need a real browser (`js`, `dom`) are skipped.
 
 Progress is stored in `output/crawl.db`, so you can stop with Ctrl+C and rerun to resume.
-Results are also appended every 5 seconds to a **live CSV** you can watch while it runs:
+Results are also appended every 5 seconds to a **live CSV** you can watch while it runs
+(columns: domain, country, places, status, http_status, final_url, title, description, site_name,
+lang, emails, phones, nine social links, org_name, org_address, tech, tech_categories, generator,
+contact_url, about_url, pages, error, crawled_at as a readable date):
 `output/crawl_live.csv`, or `output/crawl_live_shard0of4.csv` etc. when using `--shard`
 (one file per window so they never collide). Only successfully crawled sites are written unless
 you pass `--live-all`. If the file is open in Excel (which locks it), rows are kept in memory and

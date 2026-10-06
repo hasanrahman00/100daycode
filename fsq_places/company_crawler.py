@@ -56,7 +56,42 @@ INFO_COLS = ["title", "description", "site_name", "lang", "emails", "phones", *S
              "tech", "tech_categories", "generator",
              "contact_url", "about_url"]
 RESULT_COLS = ["status", "http_status", "final_url", *INFO_COLS, "pages", "error", "crawled_at"]
-LIVE_COLS = ["domain", "country", "places", *RESULT_COLS]
+LIVE_COLS = ["domain", "country", "places", *RESULT_COLS]  # order of rows built during a crawl
+# Columns written to crawl_live.csv and crawl_results.csv (the database keeps everything)
+SITE_COLS = ["final_url", "title", "description", "site_name", "lang", "emails", "phones", *SOCIAL_COLS,
+             "org_name", "org_address", "tech", "tech_categories", "generator", "contact_url", "about_url"]
+OUTPUT_COLS = ["domain", "country", "places", "status", "http_status", *SITE_COLS, "pages", "error", "crawled_at"]
+
+
+def as_date(ts) -> str:
+    """Unix timestamp -> 'YYYY-MM-DD HH:MM:SS' in local time."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+    except (TypeError, ValueError):
+        return ""
+
+
+def output_row(record: dict) -> list:
+    return [as_date(record.get(c)) if c == "crawled_at" else record.get(c) for c in OUTPUT_COLS]
+
+
+def start_live_file(path: Path) -> Path:
+    """Keep appending to an existing live file only if it has the same columns; otherwise move it aside."""
+    if not path.exists() or path.stat().st_size == 0:
+        return path
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        header = next(csv.reader(f), [])
+    if header == OUTPUT_COLS:
+        return path
+    old = path.with_name(f"{path.stem}_old_{time.strftime('%Y%m%d_%H%M%S')}{path.suffix}")
+    try:
+        path.rename(old)
+        print(f"Columns changed: moved the previous live file to {old.name}")
+        return path
+    except OSError:  # locked (open in Excel): write to a new file instead
+        new = path.with_name(f"{path.stem}_{time.strftime('%Y%m%d_%H%M%S')}{path.suffix}")
+        print(f"Columns changed and {path.name} is locked; writing to {new.name}")
+        return new
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS sites (
@@ -286,8 +321,8 @@ async def run_crawl(args, pool):
     update_sql = f"UPDATE sites SET {', '.join(f'{c}=?' for c in RESULT_COLS)} WHERE domain=?"
 
     # Live CSV on disk, appended every few seconds; one file per shard so windows don't collide
-    live_path = Path(args.live) if args.live else args.out_dir / (
-        "crawl_live.csv" if shards == 1 else f"crawl_live_shard{shard}of{shards}.csv")
+    live_path = start_live_file(Path(args.live) if args.live else args.out_dir / (
+        "crawl_live.csv" if shards == 1 else f"crawl_live_shard{shard}of{shards}.csv"))
     live_pending: list = []
     live_warned = False
     print(f"Live results file: {live_path.resolve()}")
@@ -301,7 +336,7 @@ async def run_crawl(args, pool):
             with open(live_path, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
                 w = csv.writer(f)
                 if new:
-                    w.writerow(LIVE_COLS)
+                    w.writerow(OUTPUT_COLS)
                 w.writerows(live_pending)
             live_pending.clear()
             live_warned = False
@@ -315,8 +350,8 @@ async def run_crawl(args, pool):
         if results:
             con.executemany(update_sql, [row[3:] for row in results])
             con.commit()
-            live_pending.extend(row[:3] + row[3:-1] for row in results
-                               if args.live_all or row[3] == "ok")
+            live_pending.extend(output_row(dict(zip(LIVE_COLS, row[:-1]))) for row in results
+                                if args.live_all or row[3] == "ok")
             results.clear()
         write_live()
 
@@ -404,13 +439,13 @@ def cmd_crawl(args):
 def cmd_export(args):
     con = connect(args.db)
     out = args.out_dir / "crawl_results.csv"
-    cols = ["domain", *RESULT_COLS]
     n = 0
-    with open(out, "w", newline="", encoding="utf-8") as f:
+    with open(out, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
-        w.writerow(cols)
-        for row in con.execute(f"SELECT {', '.join(cols)} FROM sites WHERE status = 'ok'"):
-            w.writerow(row)
+        w.writerow(OUTPUT_COLS)
+        cur = con.execute(f"SELECT {', '.join(OUTPUT_COLS)} FROM sites WHERE status = 'ok'")
+        for row in cur:
+            w.writerow(output_row(dict(zip(OUTPUT_COLS, row))))
             n += 1
     print(f"Wrote {out} ({n:,} crawled sites)")
     return out
@@ -426,10 +461,10 @@ def cmd_join(args):
     con = duckdb.connect()
     con.execute("SET preserve_insertion_order = false")
     cols = ", ".join(f"CASE WHEN lower(coalesce(c.likely_directory, 'false')) <> 'true' THEN r.{col} END AS site_{col}"
-                     for col in ["final_url", *INFO_COLS])
+                     for col in SITE_COLS)
     con.execute(f"""
         COPY (
-            SELECT c.*, r.status AS crawl_status, {cols}
+            SELECT c.*, r.status AS crawl_status, r.crawled_at AS site_crawled_at, {cols}
             FROM read_csv('{args.companies}', header=true, quote='"', all_varchar=true) c
             LEFT JOIN read_csv('{results}', header=true, quote='"', all_varchar=true) r USING (domain)
         ) TO '{out}' (FORMAT CSV, HEADER)
