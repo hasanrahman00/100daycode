@@ -27,6 +27,7 @@ import asyncio
 import csv
 import logging
 import os
+import random
 import sqlite3
 import sys
 import time
@@ -234,9 +235,79 @@ ERROR_HINTS = {
 
 # ---------------------------------------------------------------- crawling
 
-async def fetch(session, url):
-    """-> (status, final url, html or None on HTTP error, headers, cookies)"""
-    async with session.get(url, allow_redirects=True, max_redirects=5) as r:
+# ---------------------------------------------------------------- proxy list
+
+def parse_proxy(line: str) -> str | None:
+    """Accepts ip:port:user:pass (Webshare download format), user:pass@ip:port, ip:port or a full URL."""
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if "://" in line:
+        if not line.startswith(("http://", "https://")):
+            raise SystemExit(f"Only HTTP proxies are supported (not {line.split('://')[0]}); "
+                             "download the HTTP list from your provider")
+        return line
+    if "@" in line:
+        return "http://" + line
+    parts = line.split(":")
+    if len(parts) == 4:
+        ip, port, user, password = parts
+        return f"http://{user}:{password}@{ip}:{port}"
+    if len(parts) == 2:
+        return "http://" + line
+    raise SystemExit(f"Can't read proxy line: {line!r}")
+
+
+class ProxyPool:
+    """Picks a random working proxy per site; proxies that keep failing are rested for a while."""
+
+    def __init__(self, proxies: list[str]):
+        self.proxies = proxies
+        self.fails: Counter = Counter()
+        self.rest_until: dict[str, float] = {}
+
+    def pick(self, avoid: set | None = None) -> str:
+        now = time.time()
+        avoid = avoid or set()
+        usable = ([p for p in self.proxies if self.rest_until.get(p, 0) <= now and p not in avoid]
+                  or [p for p in self.proxies if p not in avoid] or self.proxies)
+        return random.choice(usable)
+
+    def failed(self, proxy: str):
+        self.fails[proxy] += 1
+        if self.fails[proxy] >= 5:  # 5 proxy errors in a row: rest it for 10 minutes
+            self.rest_until[proxy] = time.time() + 600
+            self.fails[proxy] = 0
+
+    def worked(self, proxy: str):
+        self.fails[proxy] = 0
+
+
+PROXIES: ProxyPool | None = None
+PROXY_ERRORS = (aiohttp.ClientProxyConnectionError, aiohttp.ClientHttpProxyError)
+
+
+async def fetch(session, url, proxy: str | None = None):
+    """-> (status, final url, html or None on HTTP error, headers, cookies).
+    With a proxy list, a failing proxy is swapped for another one (up to 3 tries)."""
+    tried: set = set()
+    for attempt in range(3 if PROXIES and proxy else 1):
+        try:
+            result = await _fetch(session, url, proxy)
+            if PROXIES and proxy:
+                PROXIES.worked(proxy)
+            return result
+        except PROXY_ERRORS:
+            if not (PROXIES and proxy) or attempt == 2:
+                raise
+            PROXIES.failed(proxy)
+            tried.add(proxy)
+            proxy = PROXIES.pick(avoid=tried)
+
+
+async def _fetch(session, url, proxy: str | None):
+    kwargs = {"proxy": proxy} if proxy else {}
+    async with session.get(url, allow_redirects=True, max_redirects=5, **kwargs) as r:
         headers = {k: v for k, v in r.headers.items()}
         cookies = {k: m.value for k, m in r.cookies.items()}
         ctype = r.headers.get("content-type", "")
@@ -248,9 +319,10 @@ async def fetch(session, url):
         return r.status, str(r.url), body.decode(r.charset or "utf-8", errors="ignore"), headers, cookies
 
 
-async def robots_allows(session, base_url) -> bool:
+async def robots_allows(session, base_url, proxy: str | None = None) -> bool:
     try:
-        async with session.get(urljoin(base_url, "/robots.txt"), allow_redirects=True) as r:
+        kwargs = {"proxy": proxy} if proxy else {}
+        async with session.get(urljoin(base_url, "/robots.txt"), allow_redirects=True, **kwargs) as r:
             if r.status >= 400:
                 return True
             text = (await r.content.read(200_000)).decode("utf-8", errors="ignore")
@@ -302,13 +374,14 @@ async def crawl_site(session, domain, args, pool) -> dict:
     if is_skipped(domain):
         return {"status": "skipped"}
     loop = asyncio.get_running_loop()
+    proxy = PROXIES.pick() if PROXIES else None  # one proxy per site keeps its pages consistent
     last_error, status_code = None, None
     for scheme in ("https", "http"):
         base = f"{scheme}://{domain}/"
         # robots.txt and the homepage are fetched at the same time
-        robots = None if args.no_robots else asyncio.create_task(robots_allows(session, base))
+        robots = None if args.no_robots else asyncio.create_task(robots_allows(session, base, proxy))
         try:
-            status_code, final_url, html, headers, cookies = await fetch(session, base)
+            status_code, final_url, html, headers, cookies = await fetch(session, base, proxy)
         except asyncio.TimeoutError:
             if robots:
                 robots.cancel()
@@ -334,7 +407,7 @@ async def crawl_site(session, domain, args, pool) -> dict:
 
         async def sub_page(url):
             try:
-                _, sub_url, sub_html, _, _ = await fetch(session, url)
+                _, sub_url, sub_html, _, _ = await fetch(session, url, proxy)
             except Exception:
                 return None
             return await analyze(loop, pool, analyze_sub, sub_html, sub_url) if sub_html else None
@@ -421,7 +494,8 @@ async def run_crawl(args, pool):
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max(64, args.concurrency)))
     quiet_connection_resets(asyncio.get_running_loop())
     print(f"DNS: {'system resolver' if args.dns == 'system' else 'public DNS servers'}; "
-          f"user agent: {args.user_agent}; proxy: {'yes' if args.proxy else 'no'}")
+          f"user agent: {args.user_agent}; "
+          f"proxy: {f'{len(PROXIES.proxies):,} from list' if PROXIES else 'yes' if args.proxy else 'no'}")
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
     results: list = []
@@ -643,8 +717,16 @@ def cmd_diagnose(args):
 
 
 def cmd_crawl(args):
+    global PROXIES
     if args.only_blocked and not args.retry_errors:
         sys.exit("--only-blocked works together with --retry-errors")
+    if args.proxy_file:
+        lines = Path(args.proxy_file).read_text(encoding="utf-8-sig").splitlines()
+        proxies = [p for line in lines if (p := parse_proxy(line))]
+        if not proxies:
+            sys.exit(f"No proxies found in {args.proxy_file}")
+        PROXIES = ProxyPool(proxies)
+        print(f"Loaded {len(proxies):,} proxies from {args.proxy_file}")
     workers = args.workers_used = args.workers or max(1, (os.cpu_count() or 2) - 1)
     tech_data = None if args.no_tech else args.tech_data
     if tech_data:
@@ -719,6 +801,8 @@ def main():
     s.add_argument("--user-agent", default="bot",
                    help="'bot' (default, honest crawler name), 'browser' (looks like Chrome) or a custom string")
     s.add_argument("--proxy", help="Proxy URL, e.g. http://user:pass@gate.provider.com:8000")
+    s.add_argument("--proxy-file", help="Text file with one proxy per line (ip:port:user:pass, e.g. a "
+                                        "Webshare list); each site uses a random one")
     s.add_argument("--progress-every", type=float, default=15,
                    help="Seconds between progress updates (under 5 refreshes one line in place)")
     s.add_argument("--no-robots", action="store_true", help="Don't check robots.txt (faster, less polite)")
