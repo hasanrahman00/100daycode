@@ -114,14 +114,47 @@ def cmd_stats(args):
     if not ok:
         return
     print(f"\nOf {ok:,} sites crawled successfully, how many had each field:")
-    for col in ["emails", "phones", *SOCIAL_COLS, "org_name", "founding_date", "employees", "tech"]:
+    for col in ["emails", "phones", "org_address", *SOCIAL_COLS, "org_name", "founding_date", "employees",
+                "tech", "contact_url"]:
         n = con.execute(f"SELECT count(*) FROM sites WHERE status='ok' AND {col} IS NOT NULL AND {col} <> ''").fetchone()[0]
         print(f"  {col:<14} {n:>12,}  {n / ok:6.1%}")
-    rate = con.execute("SELECT count(*), max(crawled_at) - min(crawled_at) FROM sites WHERE crawled_at IS NOT NULL").fetchone()
+
+    errors = con.execute("""
+        SELECT CASE WHEN error LIKE 'HTTP %' THEN error
+                    ELSE substr(error, 1, instr(coalesce(error, '?') || ':', ':') - 1) END AS kind, count(*)
+        FROM sites WHERE status = 'error' GROUP BY 1 ORDER BY 2 DESC LIMIT 12
+    """).fetchall()
+    if errors:
+        n_err = sum(n for _, n in errors)
+        print("\nWhy sites failed:")
+        for kind, n in errors:
+            print(f"  {kind or 'unknown':<34} {n:>10,}  {n / n_err:6.1%}  {ERROR_HINTS.get(kind, '')}")
+
+    # Speed over the last 10 minutes of activity, so pauses between runs don't skew it
+    last = con.execute("SELECT max(CAST(crawled_at AS INTEGER)) FROM sites WHERE crawled_at IS NOT NULL").fetchone()[0]
     pending = dict(rows).get("pending", 0)
-    if rate[1] and int(rate[1]) > 60:
-        per_sec = rate[0] / int(rate[1])
-        print(f"\nAverage speed {per_sec:.0f} sites/s  ->  {pending:,} pending ≈ {pending / per_sec / 3600:.1f} h")
+    if last:
+        n, first = con.execute("SELECT count(*), min(CAST(crawled_at AS INTEGER)) FROM sites "
+                               "WHERE CAST(crawled_at AS INTEGER) >= ?", (last - 600,)).fetchone()
+        if last - first >= 30:
+            per_sec = n / (last - first)
+            print(f"\nRecent speed {per_sec:.1f} sites/s  ->  {pending:,} pending ≈ {pending / per_sec / 3600:.1f} h")
+
+
+ERROR_HINTS = {
+    "ClientConnectorDNSError": "domain doesn't exist any more (or DNS is overloaded)",
+    "ClientConnectorError": "server refused or unreachable",
+    "ClientConnectorCertificateError": "broken HTTPS certificate",
+    "ClientConnectorSSLError": "HTTPS handshake failed",
+    "Timeout": "no answer within --timeout (slow/dead site, or your connection is saturated)",
+    "TimeoutError": "whole site took too long",
+    "ServerDisconnectedError": "server closed the connection",
+    "TooManyRedirects": "redirect loop",
+    "HTTP 403": "site blocks bots",
+    "HTTP 404": "homepage not found",
+    "HTTP 429": "rate-limited",
+    "HTTP 503": "site down or bot protection",
+}
 
 
 # ---------------------------------------------------------------- crawling
