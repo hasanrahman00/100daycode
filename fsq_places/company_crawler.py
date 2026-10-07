@@ -201,6 +201,7 @@ def cmd_stats(args):
     print("\nCounting errors...", flush=True)
     kinds = con.execute("""
         SELECT CASE WHEN status <> 'error' THEN '' WHEN error LIKE 'HTTP %' THEN error
+                    WHEN error LIKE '%DNS%timed out%' THEN 'DNS timeout'
                     ELSE substr(error, 1, instr(coalesce(error, '?') || ':', ':') - 1) END AS kind,
                count(*), sum(CAST(crawled_at AS INTEGER) >= ?), min(CASE WHEN CAST(crawled_at AS INTEGER) >= ?
                                                                          THEN CAST(crawled_at AS INTEGER) END)
@@ -224,6 +225,7 @@ def cmd_stats(args):
 
 
 ERROR_HINTS = {
+    "DNS timeout": "DNS lookup timed out: DNS servers overloaded (lower --concurrency or change --dns)",
     "ClientConnectorDNSError": "domain doesn't exist any more (or DNS is overloaded)",
     "ClientConnectorError": "server refused or unreachable",
     "ClientConnectorCertificateError": "broken HTTPS certificate",
@@ -371,6 +373,8 @@ DASH_LABELS = {"org_address": "address", "org_name": "company name", "contact_ur
 def error_kind(error: str | None) -> str:
     if not error:
         return "unknown"
+    if "DNS" in error and "timed out" in error:
+        return "DNS timeout"  # the lookup itself timed out: DNS overloaded, not necessarily a dead domain
     kind = error if error.startswith("HTTP ") else error.split(":")[0]
     return {"ClientConnectorDNSError": "dead domain (DNS)", "ClientConnectorError": "refused",
             "TimeoutError": "Timeout", "ServerDisconnectedError": "disconnected"}.get(kind, kind)
