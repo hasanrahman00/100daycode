@@ -525,8 +525,9 @@ def make_session(concurrency: int, timeout: float, dns: str, user_agent: str = "
                                  connector=connector, headers=make_headers(user_agent), proxy=proxy)
 
 
-# aiohttp logs "Can not load cookies: Illegal cookie name ..." for odd cookies some sites send. Harmless.
-logging.getLogger("aiohttp.client").setLevel(logging.ERROR)
+# aiohttp logs "Can not load cookies: Illegal cookie name ..." (logger aiohttp.internal) for odd cookies
+# some sites send. Harmless, and it would break the live dashboard, so silence all aiohttp warnings.
+logging.getLogger("aiohttp").setLevel(logging.ERROR)
 
 
 def quiet_connection_resets(loop):
